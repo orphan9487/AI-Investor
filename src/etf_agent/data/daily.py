@@ -14,7 +14,7 @@ import pandas as pd
 from . import store
 from .exchange import latest_announcements, latest_monthly_revenue, tpex_institutional, twse_institutional
 from .finmind import load_cached, merge_into_cache
-from .prices import update_prices
+from .prices import merge_official_vwap, update_official_vwap, update_prices
 from .universe import load_universe
 
 
@@ -64,12 +64,16 @@ def daily_update(start: str = "2021-01-01") -> dict:
     ids = uni["stock_id"].tolist()
     prices = update_prices(uni, start)
     dates = pd.DatetimeIndex(sorted(prices["date"].unique()))
+    vwap_days = update_official_vwap(dates[-10:], set(ids))
+    if vwap_days:
+        store.write_parquet(merge_official_vwap(prices), store.PRICES_PATH)
     insti = update_institutional(ids, dates)
     rev = update_revenue(ids)
     ann = update_announcements(ids)
     return {
         "announcements_added": ann,
         "last_price_date": dates[-1].date().isoformat(),
+        "official_vwap_days_added": [d.date().isoformat() for d in vwap_days],
         "institutional_days_added": [d.date().isoformat() for d in insti],
         "revenue_stocks_updated": rev,
     }

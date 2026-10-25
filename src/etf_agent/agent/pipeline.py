@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -23,9 +24,12 @@ from ..data.view import MarketData
 from ..rules import RULES, check_portfolio
 from ..strategies.composite import CompositeScore
 from .decision import CANDIDATE_RANK, apply_decision, fallback, parse_decision
+from .diagnostics import concentration, render_concentration_md
+from .health import Check, StaleDataError, render_checks_md, run_checks
 from .ledger import Ledger
 
 RUNS_DIR = store.PROJECT_ROOT / "runs"
+INBOX_DIR = store.PROJECT_ROOT / "inbox"  # 從後台下載的資料包放這裡
 LEDGER_PATH = store.PROJECT_ROOT / "state" / "ledger.json"
 
 COMPETITION_START = pd.Timestamp("2026-10-26")
@@ -35,13 +39,32 @@ ANNOUNCEMENT_DAYS = 7
 
 @dataclass
 class AgentConfig:
-    exec_price: str = "open"  # 官方成交價基準確認前的假設
+    exec_price: str = "vwap"  # 比賽規則：交易日當天的成交均價，全數成交
     band: float = 0.01
-    stress_gap: float = 0.03  # 隔日開盤全面上漲 3% 時，買進金額仍不能超過現金
+    # 成交均價相對前一日收盤：買進全面貴 stress_gap、賣出全面便宜 stress_gap 時，現金仍不能變負
+    # （現金為負會記警告且當天交易無效）。依歷史分布校準，見 README
+    stress_gap: float = 0.05
     strategy: CompositeScore | None = None
+    model_version: str = os.environ.get("ETF_AGENT_MODEL", "claude-opus-5-5")  # D-Plan agent_metadata
+    team_id: str = os.environ.get("ETF_TEAM_ID", "")  # 有資料包時以資料包為準
 
     def make_strategy(self) -> CompositeScore:
         return self.strategy or CompositeScore()
+
+
+SUBMIT_CUTOFF = (8, 55)  # 交易日當天 08:55 截止；前一個交易日 19:30 開放
+
+
+def target_trade_date(now: datetime, holidays: set | None = None) -> pd.Timestamp:
+    """這次執行是替哪個交易日做決策：08:55 前跑是今天（若今天是交易日），其餘時間是下一個交易日。"""
+    from ..data.exchange import twse_holidays
+
+    holidays = twse_holidays() if holidays is None else holidays
+    today = pd.Timestamp(now.date())
+    before_cutoff = (now.hour, now.minute) < SUBMIT_CUTOFF
+    if before_cutoff and today.weekday() < 5 and today not in holidays:
+        return today
+    return next_trading_day(today, holidays)
 
 
 def run_dir(trade_date: str) -> Path:
@@ -70,27 +93,64 @@ def load_ledger() -> Ledger:
 
 # ---------------------------------------------------------------- 結算前次委託
 
+def day_violations(ledger: Ledger, before: dict, close: pd.Series, universe: set[str]) -> list[str]:
+    """依比賽第六節（十四）判定當天交易是否無效。
+    個股權重超標：因「加碼」造成的才算；單純價格上漲造成的有 5 個交易日緩衝，這裡只提醒不判無效。"""
+    problems = []
+    nav = ledger.nav(close)
+    if ledger.cash < 0:
+        problems.append(f"現金為負（{ledger.cash:,.0f}）")
+    elif nav > 0 and ledger.cash / nav > RULES.max_cash_weight:
+        problems.append(f"現金比重 {ledger.cash / nav:.2%} 超過 {RULES.max_cash_weight:.0%}")
+    n = len(ledger.shares)
+    if not RULES.min_holdings <= n <= RULES.max_holdings:
+        problems.append(f"持股 {n} 檔")
+    for s, k in ledger.shares.items():
+        if s not in universe:
+            problems.append(f"{s} 不在標的池")
+        if k > before["shares"].get(s, 0) and k * float(close[s]) / nav > RULES.cap_for(s):
+            problems.append(f"{s} 加碼後權重 {k * float(close[s]) / nav:.2%} 超過上限")
+    return problems
+
+
 def settle_pending(md: MarketData, ledger: Ledger, cfg: AgentConfig) -> list[str]:
-    """把交易日 <= 最新資料日、且尚未結算的委託，依序用當天價格成交。回傳結算的交易日。"""
+    """從帳本最後日期之後，逐個交易日：先累積除權息（以前一日持股計），再用當天成交均價結算該日委託。
+    當天結算違反規則時，比照主辦方「當日交易視為無效」還原成前一日持股。回傳結算的交易日。"""
     settled = []
-    if not RUNS_DIR.exists():
-        return settled
     last = md.dates[-1]
-    for d in sorted(p.name for p in RUNS_DIR.iterdir() if p.is_dir()):
-        status = _read_status(d)
-        if status.get("state") != "final" or pd.Timestamp(d) > last:
+    since = pd.Timestamp(ledger.asof) if ledger.asof else md.dates[0] - pd.Timedelta(days=1)
+    events = md.dividend_events
+    universe = set(md.stock_ids)
+    finals = {p.name for p in RUNS_DIR.iterdir() if p.is_dir() and _read_status(p.name).get("state") == "final"} \
+        if RUNS_DIR.exists() else set()
+
+    for d in [x for x in md.dates if since < x <= last]:
+        ds = d.date().isoformat()
+        if ledger.shares and not events.empty:
+            ledger.accrue_dividends(events[events["ex_date"] == d], ds)
+        if ds not in finals:
             continue
-        if pd.Timestamp(d) not in md.dates:
-            _write_status(d, state="skipped", note="資料中沒有這個交易日")
-            continue
-        orders = pd.read_csv(run_dir(d) / "orders.csv", dtype={"stock_id": str})
-        ts = pd.Timestamp(d)
-        fills = ledger.apply_fills(orders[["stock_id", "shares"]], md.panels[cfg.exec_price].loc[ts],
-                                   md.panels["volume"].loc[ts], d)
-        fills.to_csv(run_dir(d) / "fills.csv", index=False, encoding="utf-8-sig")
-        _write_status(d, state="settled", n_filled=int((fills["status"] == "成交").sum()), n_orders=len(orders))
-        _log(d, "settled", cash=ledger.cash, n_holdings=len(ledger.shares))
-        settled.append(d)
+        orders = pd.read_csv(run_dir(ds) / "orders.csv", dtype={"stock_id": str})
+        before = ledger.snapshot()
+        fills = ledger.apply_fills(orders[["stock_id", "shares"]], md.panels[cfg.exec_price].loc[d],
+                                   md.panels["volume"].loc[d], ds)
+        problems = day_violations(ledger, before, md.panels["close"].ffill().loc[d], universe)
+        fills.to_csv(run_dir(ds) / "fills.csv", index=False, encoding="utf-8-sig")
+        if problems:
+            ledger.restore(before)
+            ledger.history.append({"date": ds, "event": "invalid_day", "problems": problems})
+            _write_status(ds, state="invalid", problems=problems)
+            _log(ds, "invalid_day", problems=problems)
+        else:
+            _write_status(ds, state="settled", n_filled=int((fills["status"] == "成交").sum()),
+                          n_orders=len(orders))
+            _log(ds, "settled", cash=ledger.cash, n_holdings=len(ledger.shares))
+        settled.append(ds)
+
+    # 已提交但資料裡沒有這一天（臨時休市）
+    for ds in finals:
+        if pd.Timestamp(ds) <= last and pd.Timestamp(ds) not in md.dates:
+            _write_status(ds, state="skipped", note="資料中沒有這個交易日（休市？）")
     if ledger.asof is None or pd.Timestamp(ledger.asof) < last:
         ledger.asof = last.date().isoformat()
     return settled
@@ -111,20 +171,51 @@ def _write_status(trade_date: str, **kw) -> None:
 # ---------------------------------------------------------------- prepare
 
 def prepare(update: bool = True, cfg: AgentConfig | None = None, md: MarketData | None = None,
-            trade_date: str | None = None) -> Path:
+            trade_date: str | None = None, allow_stale: bool = False, now=None,
+            holidays: set | None = None, datapack_path: Path | None = None) -> Path:
+    from . import datapack as dpk
+
     cfg = cfg or AgentConfig()
     if update:
         from ..data.daily import daily_update
 
         daily_update()
+    from ..data.daily import load_announcements
+
     md = md or MarketData.load()
     asof = md.dates[-1]
-    trade_date = trade_date or next_trading_day(asof).date().isoformat()
+    trade_date = trade_date or target_trade_date(now or datetime.now(), holidays).date().isoformat()
+    # 資料包的 trade_date 是平台指定的決策日，最權威
+    dp = dpk.load(datapack_path) if datapack_path else dpk.find_latest(INBOX_DIR, trade_date)
+    if dp is not None and dp.trade_date != trade_date:
+        trade_date = dp.trade_date
     d = run_dir(trade_date)
     d.mkdir(parents=True, exist_ok=True)
 
+    checks = run_checks(md, now=now, holidays=holidays, announcements=load_announcements(),
+                        check_closures=not allow_stale)
+    fatal = [c for c in checks if c.fatal and not c.ok]
+    if fatal and not allow_stale:
+        _write_status(trade_date, state="failed", problems=[f"{c.name}：{c.detail}" for c in fatal])
+        _log(trade_date, "health_failed", checks=[vars(c) for c in checks])
+        raise StaleDataError("；".join(f"{c.name}：{c.detail}" for c in fatal))
+
     ledger = load_ledger()
     settled = settle_pending(md, ledger, cfg)
+    dp_diff = None
+    if dp is not None and dp.has_positions:
+        # 平台的真實結算覆蓋模擬結算；模擬與平台的差異留紀錄
+        dp_diff = dpk.apply_to_ledger(dp, ledger)
+        if dp.as_of_date and dp.prev_outcome == "voided":
+            _write_status(dp.as_of_date, state="invalid", problems=dp.void_reasons, source="DataPack")
+        elif dp.as_of_date and dp.prev_outcome == "executed":
+            _write_status(dp.as_of_date, state="settled", source="DataPack", excluded=dp.excluded_codes)
+        _log(trade_date, "datapack_applied", source=dp.source, generated_at=dp.generated_at, diff=dp_diff)
+    elif dp is not None:
+        checks.append(Check("資料包", False, "平台尚無前一交易日結算（missing 含 prev_settlement），改用模擬帳本；"
+                                            "結算產生後請重新下載資料包再執行"))
+    else:
+        checks.append(Check("資料包", False, f"inbox/ 找不到 {trade_date} 的資料包，帳本使用模擬結算"))
     ledger.save(LEDGER_PATH)
 
     view = md.view(asof)
@@ -162,8 +253,6 @@ def prepare(update: bool = True, cfg: AgentConfig | None = None, md: MarketData 
     base_rows = [row(s) for s in order]
     reserve = [s for s in scores.index[scores["rank"] <= CANDIDATE_RANK] if s not in base.index]
     held_not_base = [s for s in ledger.shares if s not in base.index]
-    from ..data.daily import load_announcements
-
     watch = set(base.index) | set(reserve) | set(held_not_base)
     ann = load_announcements()
     if not ann.empty:
@@ -197,7 +286,20 @@ def prepare(update: bool = True, cfg: AgentConfig | None = None, md: MarketData 
         "base_portfolio": base_rows,
         "reserve_candidates": [row(s) for s in reserve],
         "held_not_in_base": [row(s) for s in held_not_base],
+        "health": [vars(c) for c in checks],
+        "platform": None if dp is None else {
+            "generated_at": dp.generated_at, "as_of_date": dp.as_of_date, "missing": dp.missing,
+            "prev_outcome": dp.prev_outcome, "void_reasons": dp.void_reasons,
+            "excluded_codes": dp.excluded_codes, "violations": dp.violations,
+            "notices": dp.compliance.get("notices", 0), "incidents": dp.compliance.get("incidents", []),
+            "summary": dpk.summary_lines(dp), "ledger_diff": dp_diff,
+            "team_id": dp.team_id,
+            "nav_tradable": (dp.account or {}).get("nav_tradable"),
+            "cash": (dp.account or {}).get("cash"),
+            "holdings": dp.holdings,
+        },
         "announcements": announcements,
+        "concentration": concentration(view, base),
         "ledger_shares": ledger.shares,
         "strategy": {k: v for k, v in vars(strat).items() if not k.startswith("_")},
     }
@@ -234,6 +336,14 @@ def render_context_md(ctx: dict) -> str:
         f"- 目前違規：{'；'.join(p['violations']) if p['violations'] else '無'}",
         f"- 成交價假設：{ctx['assumptions']['exec_price']}",
         "",
+        "## 資料健康檢查",
+        "",
+        render_checks_md([Check(**c) for c in ctx["health"]]),
+        "",
+        "## 平台資料包（主辦方實際結算與合規狀態）",
+        "",
+        *([f"- {x}" for x in ctx["platform"]["summary"]] if ctx.get("platform") else ["- （本次沒有資料包）"]),
+        "",
         "## 量化基準組合（finalize 會以此為起點）",
         "",
         _table(ctx["base_portfolio"]),
@@ -242,6 +352,8 @@ def render_context_md(ctx: dict) -> str:
         "",
         _table(ctx["reserve_candidates"]),
     ]
+    names = {r["stock_id"]: r["name"] for r in ctx["base_portfolio"]}
+    lines += ["", "## 基準組合的集中度與相關性", "", render_concentration_md(ctx["concentration"], names)]
     lines += ["", f"## 近 {ANNOUNCEMENT_DAYS} 日重大訊息（公開資訊觀測站，僅列上方股票）", ""]
     if ctx["announcements"]:
         lines += [f"- {a['date']} **{a['stock_id']} {a['name']}**：{a['subject']}" for a in ctx["announcements"]]
@@ -273,7 +385,22 @@ def _table(rows: list[dict]) -> str:
 
 # ---------------------------------------------------------------- finalize
 
-def finalize(trade_date: str, cfg: AgentConfig | None = None, md: MarketData | None = None) -> Path:
+def official_close(asof: pd.Timestamp, stock_ids: list[str], fallback: pd.Series) -> tuple[pd.Series, list[str]]:
+    """交易所公布的 T-1 收盤價（主辦方推導委託用的價格）。查不到的用 fallback 並回報。"""
+    from ..data.exchange import tpex_daily_quotes, twse_daily_quotes
+
+    q = pd.concat([twse_daily_quotes(asof), tpex_daily_quotes(asof)], ignore_index=True)
+    off = q.dropna(subset=["close"]).drop_duplicates("stock_id").set_index("stock_id")["close"]
+    out = fallback.copy()
+    hit = off.reindex(stock_ids).dropna()
+    out.loc[hit.index] = hit
+    return out, sorted(set(stock_ids) - set(hit.index))
+
+
+def finalize(trade_date: str, cfg: AgentConfig | None = None, md: MarketData | None = None,
+             fetch_official: bool = True) -> Path:
+    from . import dplan as dpl
+
     cfg = cfg or AgentConfig()
     d = run_dir(trade_date)
     ctx = json.loads((d / "context.json").read_text(encoding="utf-8"))
@@ -281,24 +408,37 @@ def finalize(trade_date: str, cfg: AgentConfig | None = None, md: MarketData | N
     asof = pd.Timestamp(ctx["data_asof"])
     close = md.view(asof).last("close")
     ledger = load_ledger()
+    data_warnings = []
+    taiex = None
+    if fetch_official:
+        from ..data.exchange import twse_taiex
+
+        close, no_official = official_close(asof, md.stock_ids, close)
+        held_missing = [s for s in no_official if s in ledger.shares]
+        if held_missing:
+            data_warnings.append(f"查不到交易所 {asof.date()} 收盤價、改用資料源價格：{held_missing}")
+        taiex = twse_taiex(asof)
 
     base = pd.Series({r["stock_id"]: r["base_weight"] for r in ctx["base_portfolio"]}, dtype=float)
     cand_rows = ctx["base_portfolio"] + ctx["reserve_candidates"]
     candidates = pd.DataFrame(cand_rows).set_index("stock_id").sort_values("rank")
 
-    warnings: list[str] = []
+    warnings: list[str] = list(data_warnings)
+    obj = None
     dec_path = d / "decision.json"
     if dec_path.exists():
         try:
             obj = json.loads(dec_path.read_text(encoding="utf-8"))
-            decision, warnings = parse_decision(obj, trade_date, base, candidates)
-            _log(trade_date, "decision_loaded", sha=_sha(dec_path), warnings=warnings)
+            decision, parse_warn = parse_decision(obj, trade_date, base, candidates)
+            warnings += parse_warn
+            _log(trade_date, "decision_loaded", sha=_sha(dec_path), warnings=parse_warn)
         except (json.JSONDecodeError, TypeError, AttributeError) as e:
+            obj = None
             decision = fallback(trade_date, f"decision.json 無法解析：{e}")
-            warnings = [decision.notes]
+            warnings.append(decision.notes)
     else:
         decision = fallback(trade_date, "沒有 decision.json")
-        warnings = [decision.notes]
+        warnings.append(decision.notes)
 
     final, adjustments = apply_decision(decision, base, candidates)
 
@@ -335,32 +475,65 @@ def finalize(trade_date: str, cfg: AgentConfig | None = None, md: MarketData | N
     ])
     target_df.to_csv(d / "target_holdings.csv", index=False, encoding="utf-8-sig")
     adjustments["name"] = adjustments["stock_id"].map(names)
+
+    # ---- D-Plan（每日唯一繳交物）----
+    platform = ctx.get("platform") or {}
+    dp_nav = platform.get("nav_tradable") or (ledger.cash + sum(n * float(close[s]) for s, n in ledger.shares.items()))
+    dp_cash = platform.get("cash") if platform.get("cash") is not None else ledger.cash
+    if not platform.get("nav_tradable"):
+        warnings.append("沒有資料包的 nav_tradable，D-Plan 改用帳本估算的淨值；與平台不同時委託推導會不一致，"
+                        "請下載資料包後重跑 prepare")
+    team_id = platform.get("team_id") or cfg.team_id
+    if not team_id:
+        warnings.append("沒有 team_id（資料包或環境變數 ETF_TEAM_ID），D-Plan 暫填 TEAM_UNKNOWN")
+        team_id = "TEAM_UNKNOWN"
+    markets = md.universe.set_index("stock_id")["market"].to_dict()
+    plan = dpl.build(
+        ctx=ctx, llm=obj, decision=decision, prev_shares=dict(ledger.shares), post_shares=post,
+        nav=float(dp_nav), close={s: float(v) for s, v in close.items() if pd.notna(v)}, cash=float(dp_cash),
+        markets=markets, names=names.to_dict(), taiex=taiex, team_id=team_id,
+        model_version=cfg.model_version, run_started_at=dpl.ts(ctx["generated"]),
+    )
+    dp_errors, dp_warnings = dpl.validate(plan, dict(ledger.shares), float(dp_nav),
+                                          {s: float(v) for s, v in close.items() if pd.notna(v)},
+                                          float(dp_cash), set(md.stock_ids))
+    warnings += dp_warnings
+    problems += [f"D-Plan：{e}" for e in dp_errors]
+    (d / "dplan.json").write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
+    (d / "dplan_validation.json").write_text(
+        json.dumps({"errors": dp_errors, "warnings": dp_warnings, "n_orders": len(plan["orders"]),
+                    "n_decisions": len(plan["decisions"]), "n_no_trade": len(plan["no_trade_decisions"])},
+                   ensure_ascii=False, indent=2), encoding="utf-8")
+
     (d / "decision_validated.json").write_text(
         json.dumps({"decision": decision.to_dict(), "warnings": warnings}, ensure_ascii=False, indent=2),
         encoding="utf-8")
 
     from .report import render_report
 
+    post_w = target_df.set_index("stock_id")["weight"] if len(target_df) else pd.Series(dtype=float)
+    conc = concentration(md.view(asof), post_w) if len(post_w) >= 2 else None
     report = render_report(ctx, decision, warnings, adjustments, order_df, target_df,
-                           post_cash, nav, problems, cfg)
+                           post_cash, nav, problems, cfg, conc)
     (d / "report.md").write_text(report, encoding="utf-8")
 
     state = "final" if not problems else "blocked"
     _write_status(trade_date, state=state, author=decision.author, n_orders=len(order_df),
                   problems=problems)
     _log(trade_date, "finalized", state=state, author=decision.author, n_orders=len(order_df),
-         problems=problems, orders_sha=_sha(d / "orders.csv"))
+         problems=problems, orders_sha=_sha(d / "orders.csv"), dplan_sha=_sha(d / "dplan.json"))
     return d
 
 
 def _cash_flow(orders: dict[str, int], prices: pd.Series, gap: float = 0.0) -> float:
+    """買進以 (1+gap)、賣出以 (1-gap) 倍的價格成交時的現金變化。"""
     flow = 0.0
     for s, n in orders.items():
         if n > 0:
             v = n * float(prices[s]) * (1 + gap)
             flow -= v + RULES.buy_cost(v)
         else:
-            v = -n * float(prices[s])
+            v = -n * float(prices[s]) * (1 - gap)
             flow += v - RULES.sell_cost(v)
     return flow
 

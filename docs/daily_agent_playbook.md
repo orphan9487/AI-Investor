@@ -1,7 +1,8 @@
 # 每日 Agent 作業手冊（給 Claude 排程 session 使用）
 
-你是「Agent 基金經理人」的研究員。每個交易日收盤後執行一次，替下一個交易日產出決策。
-量化模型已經選好基準組合；你的工作是讀新聞與總經事件，在**限定範圍內**做小幅調整，並寫下理由。
+你是「Agent 基金經理人」的研究員。每個交易日執行一次，替下一個交易日產出 **D-Plan**（當日 Agent 決策報告及交易書，
+主辦方每日唯一的繳交物）。繳交時間是前一個交易日 19:30 到當天 08:55。
+量化模型已經選好基準組合；你的工作是讀新聞與總經事件，在**限定範圍內**做小幅調整，並寫下有證據鏈的理由。
 整個流程由你自主完成，不要詢問使用者，也不要等待人工確認。
 
 工作目錄：`C:\programming\esun-etf-agent`
@@ -14,7 +15,9 @@
 python scripts/agent_daily.py prepare
 ```
 
-它會更新資料、結算前一次委託、產出 `runs/<交易日>/context.md`。指令輸出會告訴你交易日與檔案路徑。
+它會更新資料、讀取 `inbox/` 裡平台的資料包（DataPack，平台實際結算後的持股與現金）並以它對帳、
+產出 `runs/<交易日>/context.md`。指令輸出會告訴你交易日與檔案路徑。
+**沒有資料包時**，context 的健康檢查會出現 ⚠️，D-Plan 的委託推導可能和平台不一致（淨值不同）；在回報中提醒使用者下載資料包後重跑。
 失敗時重試一次；仍失敗就停止，在最後的回覆說明錯誤。**不要**改用 `--no-update` 拿舊資料做決策。
 
 ### 2. 讀決策材料
@@ -54,6 +57,17 @@ python scripts/agent_daily.py prepare
 4. **風險水位要克制。** 比賽比的是最終市值，抱現金通常是拖累。只有未來 2 個交易日內有重大事件、
    或市場明顯失序時才用 `cautious`；`defensive` 只在極端情況使用。
 5. **不可編造。** 每一項調整都要能對應到你實際讀到的新聞，`sources` 填新聞標題與連結。
+6. **先反駁自己。** 每個想做的調整，都先寫出最有力的反方理由（例如消息已反映在股價、只是單一來源、
+   影響不到比賽剩下的天數）。反方理由站得住，就不要調整。把正反兩方的重點都寫進 `reason`，
+   格式：「正：…；反：…；結論：…」。
+7. **看集中度。** context 的「集中度與相關性」會列出產業權重與高度相關的股票。同一組高度相關的股票
+   （例如三檔貨櫃航運）其實是同一個押注；如果這個押注本身有新的利空，可以一起減碼，
+   但不要只因為相關性高就剔除，選股已經由量化模型決定。
+8. **與宣告的 ETF 理念一致。** 本隊已向主辦單位宣告「主動台股多因子成長動能」（見 `docs/strategy_statement.json`）：
+   以營收成長、股價動能、法人籌碼選股，台積電為核心持股，限制產業集中度。調整的理由應該落在這個框架內，
+   例如營收、法說會、法人動向、產業消息；不要因為與理念無關的題材（例如高股息、純價值低估）加入或加碼股票。
+   長期偏離宣告的理念，主辦單位可以要求改善甚至取消資格。
+9. **資料健康檢查有 ⚠️ 時更保守。** 例如法人資料沒更新，代表量化分數用的是舊籌碼，當天不要做加碼。
 
 可用的調整（超出範圍的部分會被程式修正或丟棄）：
 
@@ -66,26 +80,55 @@ python scripts/agent_daily.py prepare
 
 ### 6. 寫 `runs/<交易日>/decision.json`
 
+finalize 會把它組進 D-Plan 的證據鏈：**sources（來源）→ observations（可核對的數字事實）→ 推論 → 決策 → 委託**。
+每支股票的量化事實（收盤價、動能、營收年增、法人買賣超、排名）程式會自動列出；你只需要補上
+**你自己查到的市場與新聞事實**，並在調整時引用它們。
+
 ```json
 {
   "trade_date": "2026-10-27",
   "author": "claude",
   "risk_level": "neutral",
-  "market_summary": "兩三句話說明今天的市場判斷與理由。",
-  "events": [
-    {"date": "2026-10-28", "event": "FOMC 利率決議", "impact": "可能影響科技股評價，維持中性"}
+  "regime": "neutral",
+  "market_summary": "從依據推到走向與姿態的過程（20–1000 字），例如：隔夜費半 -1.8%、台積電 ADR -1.5%，但 FOMC 前市場已預期降息，判定中性震盪，不改總曝險。",
+  "counter_evidence": "與研判相反的市場訊號；沒有就填 null",
+  "confidence": 0.65,
+  "sources": [
+    {"id": "N1", "authority": "vendor", "name": "TradingView：費城半導體指數 2026-10-26 收盤",
+     "url": "https://www.tradingview.com/symbols/NASDAQ-SOX/", "content_as_of": "2026-10-27T04:00:00+08:00"},
+    {"id": "N2", "authority": "media", "name": "Reuters：聯發科 9 月營收創同期新高",
+     "url": "https://www.tradingview.com/news/...", "published_at": "2026-10-26T15:10:00+08:00",
+     "content_as_of": "2026-10-26T15:10:00+08:00"}
   ],
+  "observations": [
+    {"id": "M1", "source": ["N1"], "topic": "us_overnight", "statement": "費城半導體指數收跌 1.8%",
+     "values": {"SOX_chg_pct": -1.8}},
+    {"id": "M2", "source": ["N2"], "topic": "stock_news", "statement": "聯發科 9 月營收年增 35%",
+     "values": {"rev_yoy_pct": 35}}
+  ],
+  "market_basis": ["M1"],
   "tilts": [
-    {"stock_id": "2454", "multiplier": 1.2, "reason": "9 月營收年增 35%，法人上修全年預估",
-     "sources": ["聯發科9月營收創同期新高 https://www.tradingview.com/news/..."]}
+    {"stock_id": "2454", "multiplier": 1.2, "evidence": ["M2"],
+     "reason": "正：9 月營收年增 35% 創同期新高；反：股價近一月已漲 12%；結論：小幅加碼",
+     "counter": "近一個月股價已先反映部分利多"}
   ],
   "exclude": [],
-  "include": [],
-  "notes": ""
+  "include": []
 }
 ```
 
-沒有要調整的就留空陣列；這是完全合理的結果。
+規則（主辦方會檢查，違反可能整份退件或整批作廢）：
+
+- **observations 只寫可核對的事實，不寫推論**，`values` 只放數字，而且要能在來源裡找到同樣的數字（主辦方會抽檢）。
+- 每筆 observation 的 `source` 必須對到 `sources` 的 `id`；每項調整的 `evidence` 必須對到 `observations` 的 `id`。
+- `authority`：交易所與主管機關資料填 `twse`／`tpex`／`taifex`／`mops`，新聞填 `media`，TradingView 等行情服務填 `vendor`。
+- 時間一律台北時區、格式 `YYYY-MM-DDTHH:MM:SS+08:00`；`content_as_of` 是資料描述的時點，不能晚於現在。
+  TradingView 新聞的 `published` 是 unix 秒（UTC），要換成台北時間，例如：
+  `python -c "import datetime as d; print(d.datetime.fromtimestamp(1792142142, d.timezone(d.timedelta(hours=8))).isoformat())"`
+- 不要使用繳交當下之後才會發生的資訊。
+- `regime`：`risk_on`／`neutral`／`risk_off`。`risk_level` 決定投入比例（見上表）。
+  淨曝險意圖（加碼／持平／減碼）與目標現金區間由程式依委託實際結果填寫，保證和委託一致，你不用寫。
+- 沒有要調整的就留空陣列；這是完全合理的結果。
 
 ### 7. 產出交易書與報告
 
@@ -93,19 +136,22 @@ python scripts/agent_daily.py prepare
 python scripts/agent_daily.py finalize
 ```
 
-- 狀態 `final`：完成。
-- 狀態 `blocked`：合規檢查未通過。讀 `report.md` 的錯誤，修正 decision.json 後重跑；
-  修不好就刪掉 decision.json 再跑一次（退回量化基準）。
+finalize 會產出 `runs/<交易日>/dplan.json`（要上傳的檔案），並模擬主辦方的收件檢核
+（schema、引用鏈、決策覆蓋、委託推導、部位宣告、現金比、持股檔數），結果在 `dplan_validation.json`。
+
+- 狀態 `final`：完成，檢核全數通過。
+- 狀態 `blocked`：有檢核錯誤。讀 `report.md` 與 `dplan_validation.json` 的錯誤，修正 decision.json 後重跑；
+  修不好就刪掉 decision.json 再跑一次（退回量化基準）。**blocked 的 D-Plan 不可以上傳。**
 - 讀 `runs/<交易日>/decision_validated.json` 的 `warnings`，確認你的調整都被採用；被丟棄的要想清楚原因。
 
 ### 8. 回報
 
 最後的回覆用繁體中文簡短說明：交易日、風險水位、做了哪些調整與理由、委託筆數、
-`orders.csv` 與 `report.md` 的路徑，以及任何警告或錯誤。
+**`dplan.json` 的路徑（提醒使用者上傳並按「送出繳交」）**、`report.md` 的路徑，以及任何警告或錯誤。
 
 ## 不可以做的事
 
-- 修改任何程式碼、`state/ledger.json`、`context.json`、`orders.csv`
+- 修改任何程式碼、`state/ledger.json`、`context.json`、`orders.csv`、`dplan.json`
 - 手動改交易書的股數或價格
 - 交易標的池以外的股票，或繞過程式的任何限制
 - 詢問使用者「要不要這樣做」：決策必須由 Agent 自主產生

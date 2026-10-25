@@ -33,6 +33,8 @@ class Action:
     reason: str
     multiplier: float | None = None
     sources: list[str] = field(default_factory=list)
+    evidence: list[str] = field(default_factory=list)  # 引用 decision.json observations[].id
+    counter: str | None = None  # 反方理由，寫進 D-Plan 推論的 counter_evidence
 
 
 @dataclass
@@ -98,7 +100,9 @@ def parse_decision(obj: dict, trade_date: str, base: pd.Series, candidates: pd.D
                 warn.append(f"{key}: 超過 {limit} 筆上限，{sid} 以後略過")
                 break
             seen.add(sid)
-            out.append(Action(sid, reason, mult, [str(s) for s in item.get("sources") or []]))
+            out.append(Action(sid, reason, mult, [str(s) for s in item.get("sources") or []],
+                              [str(e) for e in item.get("evidence") or []],
+                              str(item["counter"]) if item.get("counter") else None))
         return out
 
     exclude = actions("exclude", MAX_EXCLUDE, set(base.index) - {rules.tsmc_id}, False)

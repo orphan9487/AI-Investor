@@ -42,6 +42,8 @@ def main() -> None:
     p = sub.add_parser("prepare")
     p.add_argument("--no-update", action="store_true")
     p.add_argument("--trade-date")
+    p.add_argument("--allow-stale", action="store_true", help="價格不是最新也繼續（只用於演練）")
+    p.add_argument("--datapack", type=Path, help="資料包 JSON；省略時自動從 inbox/ 找當天的")
     f = sub.add_parser("finalize")
     f.add_argument("--trade-date")
     sub.add_parser("status")
@@ -53,13 +55,20 @@ def main() -> None:
     if args.dry_run:
         pipeline.RUNS_DIR = ROOT / "dryrun" / "runs"
         pipeline.LEDGER_PATH = ROOT / "dryrun" / "state" / "ledger.json"
+        pipeline.INBOX_DIR = ROOT / "dryrun" / "inbox"
         print("[dry-run] 使用 dryrun/，不影響正式紀錄")
 
     if args.cmd == "prepare":
-        d = pipeline.prepare(update=not args.no_update, trade_date=args.trade_date)
+        try:
+            d = pipeline.prepare(update=not args.no_update, trade_date=args.trade_date,
+                                 allow_stale=args.allow_stale, datapack_path=args.datapack)
+        except pipeline.StaleDataError as e:
+            sys.exit(f"❌ 資料健康檢查未通過，已停止：{e}")
         ctx = json.loads((d / "context.json").read_text(encoding="utf-8"))
         print(f"交易日 {ctx['trade_date']}（資料截至 {ctx['data_asof']}）")
         print(f"淨值 {ctx['portfolio']['nav']:,.0f}，累積 {ctx['portfolio']['return_since_start']:+.2%}")
+        for line in (ctx.get("platform") or {}).get("summary", ["（沒有資料包，帳本使用模擬結算）"]):
+            print(f"  {line}")
         if ctx["portfolio"]["settled_runs"]:
             print(f"已結算：{ctx['portfolio']['settled_runs']}")
         print(f"決策材料：{d / 'context.md'}")
@@ -72,8 +81,8 @@ def main() -> None:
         print(f"交易日 {td}：{st['state']}，決策來源 {st['author']}，委託 {st['n_orders']} 筆")
         for prob in st.get("problems", []):
             print(f"  ❌ {prob}")
-        print(f"交易書：{d / 'orders.csv'}")
-        print(f"決策報告：{d / 'report.md'}")
+        print(f"D-Plan（上傳這個）：{d / 'dplan.json'}")
+        print(f"人讀報告：{d / 'report.md'}")
 
     elif args.cmd == "status":
         led = pipeline.load_ledger()

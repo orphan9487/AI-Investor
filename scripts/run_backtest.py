@@ -41,7 +41,7 @@ def main() -> None:
     ap.add_argument("--strategy", default="cap_weighted", help=f"逗號分隔：{','.join(REGISTRY)}")
     ap.add_argument("--start")
     ap.add_argument("--end")
-    ap.add_argument("--exec-price", default="open", choices=["open", "close"])
+    ap.add_argument("--exec-price", default="vwap", choices=["vwap", "open", "close"])
     ap.add_argument("--rebalance-every", type=int, default=1)
     ap.add_argument("--band", type=float, default=0.01)
     ap.add_argument("--no-dividends", action="store_true")

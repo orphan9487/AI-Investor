@@ -48,6 +48,8 @@ class CompositeScore:
     skip: int = 5
     flow_days: int = 20
     min_avg_value: float = 3e8
+    # 同產業最多幾檔（台積電另計）。6：回測績效與不設限相當，但避免單一產業過度集中（見 README）
+    max_per_industry: int | None = 6
     factor_weights: dict = field(default_factory=lambda: {"mom": 0.4, "rev": 0.3, "flow": 0.3})
     name: str = "composite"
     _held: set = field(default_factory=set, repr=False)
@@ -89,9 +91,24 @@ class CompositeScore:
         n_others = self.n - (1 if use_tsmc else 0)
 
         keep = [s for s in others.index if s in held and others.at[s, "rank"] <= self.keep_rank]
-        keep = sorted(keep, key=lambda s: others.at[s, "rank"])[:n_others]
-        fill = [s for s in others.index if s not in keep][: n_others - len(keep)]
-        chosen = keep + fill
+        keep = sorted(keep, key=lambda s: others.at[s, "rank"])
+        fill = [s for s in others.index if s not in keep]
+        chosen, per_ind = [], {}
+        for s in keep + fill:  # 先續抱、再依排名補，同時遵守產業上限
+            if len(chosen) >= n_others:
+                break
+            ind = view.industry.get(s, "未分類")
+            capped = self.max_per_industry is not None and ind != "未分類"
+            if capped and per_ind.get(ind, 0) >= self.max_per_industry:
+                continue
+            chosen.append(s)
+            per_ind[ind] = per_ind.get(ind, 0) + 1
+        # 產業上限讓檔數湊不滿時（候選集中在少數產業），依排名補足：持股檔數下限優先於產業上限
+        for s in keep + fill:
+            if len(chosen) >= n_others:
+                break
+            if s not in chosen:
+                chosen.append(s)
 
         rest = self.invested - (self.tsmc_weight if use_tsmc else 0.0)
         w = cap_and_normalize(pd.Series(1.0, index=chosen), total=rest)

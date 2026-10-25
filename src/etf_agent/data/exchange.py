@@ -11,6 +11,7 @@ TPEX_DAILY_URL = "https://www.tpex.org.tw/www/zh-tw/afterTrading/dailyQuotes"
 TWSE_MIN_INTERVAL = 3.0  # TWSE 對短時間大量請求會暫時封鎖 IP
 
 _last_twse = 0.0
+QUOTE_COLUMNS = ["stock_id", "name", "open", "high", "low", "close", "volume", "value", "vwap"]
 
 
 def get_json(url: str, params: dict | None = None, retries: int = 3):
@@ -33,21 +34,46 @@ def to_num(s) -> float:
         return float("nan")
 
 
-def twse_daily_quotes(date) -> pd.DataFrame:
-    """欄位：stock_id, name, open, high, low, close, volume。休市日回傳空表。"""
+_mi_index_cache: dict[str, dict] = {}
+
+
+def _twse_mi_index(date) -> dict:
     global _last_twse
+    key = pd.Timestamp(date).strftime("%Y%m%d")
+    if key in _mi_index_cache:
+        return _mi_index_cache[key]
     wait = TWSE_MIN_INTERVAL - (time.monotonic() - _last_twse)
     if wait > 0:
         time.sleep(wait)
     _last_twse = time.monotonic()
-    ts = pd.Timestamp(date)
-    j = get_json(TWSE_DAILY_URL, {"date": ts.strftime("%Y%m%d"), "type": "ALLBUT0999", "response": "json"})
+    j = get_json(TWSE_DAILY_URL, {"date": key, "type": "ALLBUT0999", "response": "json"})
+    if j.get("stat") == "OK":
+        _mi_index_cache[key] = j
+    return j
+
+
+def twse_taiex(date) -> dict | None:
+    """加權指數收盤與漲跌幅（%）；休市日回傳 None。"""
+    j = _twse_mi_index(date)
     if j.get("stat") != "OK":
-        return pd.DataFrame(columns=["stock_id", "name", "open", "high", "low", "close", "volume"])
+        return None
+    for t in j.get("tables", []):
+        for row in t.get("data") or []:
+            if str(row[0]).strip() == "發行量加權股價指數":
+                sign = -1.0 if ("-" in str(row[2]) or "green" in str(row[2])) else 1.0
+                return {"close": to_num(row[1]), "chg_pct": sign * abs(to_num(row[4]))}
+    return None
+
+
+def twse_daily_quotes(date) -> pd.DataFrame:
+    """欄位：stock_id, name, open, high, low, close, volume, value（成交金額）, vwap（成交均價）。休市日回傳空表。"""
+    j = _twse_mi_index(date)
+    if j.get("stat") != "OK":
+        return pd.DataFrame(columns=QUOTE_COLUMNS)
     table = next(t for t in j["tables"] if t.get("fields") and "收盤價" in t["fields"])
     f = table["fields"]
     col = lambda name, conv: [conv(row[f.index(name)]) for row in table["data"]]
-    return pd.DataFrame({
+    df = pd.DataFrame({
         "stock_id": col("證券代號", str.strip),
         "name": col("證券名稱", str.strip),
         "open": col("開盤價", to_num),
@@ -55,17 +81,20 @@ def twse_daily_quotes(date) -> pd.DataFrame:
         "low": col("最低價", to_num),
         "close": col("收盤價", to_num),
         "volume": col("成交股數", to_num),
+        "value": col("成交金額", to_num),
     })
+    df["vwap"] = df["value"] / df["volume"].where(df["volume"] > 0)
+    return df
 
 
 def tpex_daily_quotes(date) -> pd.DataFrame:
-    """欄位：stock_id, name, open, high, low, close, volume, shares（發行股數）。"""
+    """欄位：同 twse_daily_quotes，另加 shares（發行股數）。"""
     ts = pd.Timestamp(date)
     j = get_json(TPEX_DAILY_URL, {"date": ts.strftime("%Y/%m/%d"), "response": "json"})
     tables = j.get("tables") or []
     # 日期不符代表該日沒有資料（伺服器會改回傳最近一個交易日）
     if j.get("date") != ts.strftime("%Y%m%d") or not tables or not tables[0].get("data"):
-        return pd.DataFrame(columns=["stock_id", "name", "open", "high", "low", "close", "volume", "shares"])
+        return pd.DataFrame(columns=QUOTE_COLUMNS + ["shares"])
     table = tables[0]
     f = table["fields"]
     col = lambda name, conv: [conv(row[f.index(name)]) for row in table["data"]]
@@ -77,6 +106,8 @@ def tpex_daily_quotes(date) -> pd.DataFrame:
         "low": col("最低", to_num),
         "close": col("收盤", to_num),
         "volume": col("成交股數", to_num),
+        "value": col("成交金額(元)", to_num),
+        "vwap": col("均價", to_num),
         "shares": col("發行股數", to_num),
     })
 

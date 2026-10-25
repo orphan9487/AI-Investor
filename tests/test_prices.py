@@ -27,3 +27,17 @@ def test_repair_replaces_placeholder_and_missing_days(monkeypatch):
     assert day1["volume"] == 5e5 and day1["close"] == 101.0
     assert day1["adj_close"] == 101.0  # 用下一個交易日的還原比例（1.0）
     assert out[out["date"] == dates[2]]["stock_id"].nunique() == 4
+
+
+def test_repair_converts_raw_exchange_prices_to_adjusted_basis(monkeypatch):
+    dates = pd.bdate_range("2026-03-02", periods=3)
+    rows = [(d, "2327", 150.0, 150.0, 150.0, 150.0, 150.0, 1e6 if d != dates[1] else 0.0, 150.0) for d in dates]
+    df = pd.DataFrame(rows, columns=P.COLUMNS)
+    # 之後有一次 1 拆 4：yfinance 歷史價已除以 4，交易所當天原始價是 600
+    splits = pd.DataFrame({"date": [pd.Timestamp("2026-08-14")], "stock_id": ["2327"], "ratio": [4.0]})
+    monkeypatch.setattr(P, "twse_daily_quotes", lambda d: pd.DataFrame(
+        {"stock_id": ["2327", "2330"], "name": "", "open": 600.0, "high": 604.0, "low": 596.0, "close": 600.0,
+         "volume": 2.5e5, "value": 1.5e8, "vwap": 600.0}))
+    out = P.repair_bad_days(df, dates, {"2327": "twse"}, splits)
+    day = out[out["date"] == dates[1]].iloc[0]
+    assert day["close"] == 150.0 and day["vwap"] == 150.0 and day["volume"] == 1e6

@@ -1,9 +1,9 @@
 """逐日回測引擎，照比賽規則模擬：10 億起始、整張成交、手續費與證交稅、每日合規檢查。
 
-時間軸（預設 exec_price="open"）：
-  第 t 日決策只能用到 t-1 日收盤（含）以前的資料 → 以 t 日開盤價成交 → 以 t 日收盤價估值
-exec_price="close" 時改成以 t 日收盤價成交，決策資料仍然只到 t-1 日。
-官方公布成交價基準後，改 BacktestConfig.exec_price 即可。
+時間軸（比賽規則）：
+  第 t 日決策只能用到 t-1 日收盤（含）以前的資料（前一晚 19:30 ~ 當天 08:55 提交）
+  → 以 t 日「成交均價」全數成交（exec_price="vwap"）→ 以 t 日收盤價估值
+也可用 "open" / "close" 做敏感度分析。
 """
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ class Strategy(Protocol):
 
 @dataclass
 class BacktestConfig:
-    exec_price: str = "open"  # "open" 或 "close"
+    exec_price: str = "vwap"  # 比賽規則：當日成交均價；也可用 "open" / "close"
     rebalance_every: int = 1  # 每幾個交易日重新決策一次
     band: float = 0.0  # 見 build_orders
     cap_buffer: float = DEFAULT_CAP_BUFFER

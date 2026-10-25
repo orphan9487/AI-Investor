@@ -32,6 +32,7 @@ def make_md(n_days=90, seed=0):
 def sandbox(tmp_path, monkeypatch):
     monkeypatch.setattr(pipeline, "RUNS_DIR", tmp_path / "runs")
     monkeypatch.setattr(pipeline, "LEDGER_PATH", tmp_path / "state" / "ledger.json")
+    monkeypatch.setattr(pipeline, "INBOX_DIR", tmp_path / "inbox")
     return tmp_path
 
 
@@ -93,11 +94,11 @@ def test_full_daily_cycle(sandbox):
     md1 = MarketData(prices=md.prices[md.prices["date"] <= day1], universe=md.universe)
 
     # 第一天：沒有 decision.json → 退回量化基準
-    d = pipeline.prepare(update=False, md=md1, trade_date=day2.date().isoformat())
+    d = pipeline.prepare(update=False, md=md1, trade_date=day2.date().isoformat(), allow_stale=True, holidays=set())
     ctx = json.loads((d / "context.json").read_text(encoding="utf-8"))
     assert ctx["data_asof"] == day1.date().isoformat()
     assert len(ctx["base_portfolio"]) == 25
-    out = pipeline.finalize(ctx["trade_date"], md=md1)
+    out = pipeline.finalize(ctx["trade_date"], md=md1, fetch_official=False)
     st = json.loads((out / "status.json").read_text(encoding="utf-8"))
     assert st["state"] == "final" and st["author"] == "fallback"
     orders = pd.read_csv(out / "orders.csv", dtype={"stock_id": str})
@@ -106,7 +107,7 @@ def test_full_daily_cycle(sandbox):
 
     # 第二天：資料多一天 → 結算前一次委託，帳本有持股
     next_td = (day2 + pd.offsets.BDay(1)).date().isoformat()
-    d2 = pipeline.prepare(update=False, md=md, trade_date=next_td)
+    d2 = pipeline.prepare(update=False, md=md, trade_date=next_td, allow_stale=True, holidays=set())
     led = pipeline.load_ledger()
     assert len(led.shares) == 25 and 0 < led.cash < 0.05 * RULES.initial_capital
     assert json.loads((out / "status.json").read_text(encoding="utf-8"))["state"] == "settled"
@@ -120,7 +121,7 @@ def test_full_daily_cycle(sandbox):
         "tilts": [{"stock_id": held[1], "multiplier": 1.3, "reason": "測試加碼理由"}],
         "author": "claude",
     }, ensure_ascii=False), encoding="utf-8")
-    out2 = pipeline.finalize(next_td, md=md)
+    out2 = pipeline.finalize(next_td, md=md, fetch_official=False)
     st2 = json.loads((out2 / "status.json").read_text(encoding="utf-8"))
     assert st2["state"] == "final" and st2["author"] == "claude"
     tgt = pd.read_csv(out2 / "target_holdings.csv", dtype={"stock_id": str})
@@ -132,3 +133,147 @@ def test_full_daily_cycle(sandbox):
 def test_missing_decision_falls_back():
     d = fallback("2026-10-27", "沒有 decision.json")
     assert d.author == "fallback" and d.risk_level == "neutral" and not d.tilts
+
+
+def test_expected_last_trading_day():
+    from datetime import datetime
+
+    from etf_agent.agent.health import expected_last_trading_day
+
+    hol = {pd.Timestamp("2026-10-26")}
+    assert expected_last_trading_day(datetime(2026, 10, 27, 10, 0), hol) == pd.Timestamp("2026-10-23")
+    assert expected_last_trading_day(datetime(2026, 10, 27, 18, 0), hol) == pd.Timestamp("2026-10-27")
+    assert expected_last_trading_day(datetime(2026, 10, 25, 18, 0), hol) == pd.Timestamp("2026-10-23")
+
+
+def test_stale_prices_stop_prepare(sandbox):
+    from datetime import datetime
+
+    md = make_md()
+    late = (md.dates[-1] + pd.Timedelta(days=7)).to_pydatetime().replace(hour=18)
+    with pytest.raises(pipeline.StaleDataError, match="價格資料最新"):
+        pipeline.prepare(update=False, md=md, trade_date="2026-12-01", now=late, holidays=set())
+    st = json.loads((pipeline.run_dir("2026-12-01") / "status.json").read_text(encoding="utf-8"))
+    assert st["state"] == "failed"
+
+
+def test_industry_cap_never_breaks_min_holdings(monkeypatch):
+    from etf_agent.strategies.composite import CompositeScore
+
+    md = make_md()
+    md.industry = pd.Series("半導體業", index=md.stock_ids)  # 全部同一產業
+    w, _ = CompositeScore(max_per_industry=6).select(md.view(md.dates[-1]), set())
+    assert len(w) == 25
+
+    md.industry = pd.Series(["半導體業", "航運業"] * 20, index=md.stock_ids)
+    w, _ = CompositeScore(max_per_industry=6).select(md.view(md.dates[-1]), set())
+    others = w.drop("2330").index
+    assert len(w) == 25 and md.industry[others].value_counts().max() >= 6
+
+
+def test_invalid_day_reverts_like_the_platform():
+    from etf_agent.agent.pipeline import day_violations
+
+    led = Ledger(cash=100_000_000, shares={s: 30_000 for s in IDS[1:26]})
+    close = pd.Series(100.0, index=IDS)
+    before = led.snapshot()
+    # 買太多 → 現金變負：整天無效、還原
+    res = led.apply_fills(pd.DataFrame({"stock_id": ["1130"], "shares": [2_000_000]}), close,
+                          pd.Series(1e7, index=IDS), "2026-10-27")
+    assert (res["status"] == "成交").all() and led.cash < 0
+    problems = day_violations(led, before, close, set(IDS))
+    assert any("現金為負" in p for p in problems)
+    led.restore(before)
+    assert led.cash == 100_000_000 and "1130" not in led.shares
+
+
+def test_price_drift_over_cap_is_not_invalid():
+    from etf_agent.agent.pipeline import day_violations
+
+    led = Ledger(cash=20_000_000, shares={s: 30_000 for s in IDS[1:26]})
+    close = pd.Series(100.0, index=IDS)
+    close[IDS[1]] = 500.0  # 沒有加碼、純粹漲價而超過 10%
+    assert day_violations(led, led.snapshot(), close, set(IDS)) == []
+
+
+def test_dividends_accrue_but_do_not_hit_cash():
+    led = Ledger(cash=10_000_000, shares={"1101": 10_000})
+    ev = pd.DataFrame({"stock_id": ["1101"], "cash": [2.5], "stock_ratio": [0.1]})
+    led.accrue_dividends(ev, "2026-11-02")
+    assert led.cash == 10_000_000
+    assert led.accrued_cash == 25_000 and led.accrued_shares == {"1101": 1000}
+    px = pd.Series({"1101": 50.0})
+    assert led.final_nav(px) - led.nav(px) == 25_000 + 1000 * 50
+
+
+def test_target_trade_date_follows_submission_window():
+    from datetime import datetime
+
+    hol = {pd.Timestamp("2026-10-26")}
+    f = pipeline.target_trade_date
+    assert f(datetime(2026, 10, 23, 20, 0), hol) == pd.Timestamp("2026-10-27")  # 週五晚上 → 跳過週末與 10/26
+    assert f(datetime(2026, 10, 26, 20, 0), hol) == pd.Timestamp("2026-10-27")  # 休市日晚上
+    assert f(datetime(2026, 10, 27, 7, 30), hol) == pd.Timestamp("2026-10-27")  # 早上備援
+    assert f(datetime(2026, 10, 27, 9, 30), hol) == pd.Timestamp("2026-10-28")  # 已過截止
+
+
+# ---- DataPack（依主辦方規格書 3.0 的範例）----
+
+def _pack(**kw):
+    base = {"schema_version": "3.0", "doc_type": "DataPack", "team_id": "TEAM_042",
+            "trade_date": "2026-10-28", "as_of_date": "2026-10-27", "generated_at": "2026-10-27T18:58:18+08:00",
+            "missing": [], "prev_day_orders": {"outcome": "executed", "void_reasons": [], "excluded_codes": []},
+            "account": {"cash": 135237741.0, "cash_ratio_tradable": 0.135265, "nav_tradable": 999795141.0,
+                        "aum": 1000795141.0, "receivable_cash": 1000000.0, "holdings_count": 2},
+            "holdings": [{"code": "2330", "shares": 73000, "receivable_shares": 0, "close_price": 2585.0,
+                          "tradable_weight": 0.188744},
+                         {"code": "6669", "shares": 0, "receivable_shares": 9913, "close_price": 2610.0,
+                          "tradable_weight": None}],
+            "compliance": {"violations": 1, "notices": 1, "incidents": [
+                {"date": "2026-10-28", "check_code": "oversell", "status": "fail", "message": "賣出超過庫存"}]}}
+    base.update(kw)
+    return base
+
+
+def test_datapack_overrides_ledger(tmp_path):
+    from etf_agent.agent import datapack as dpk
+
+    f = tmp_path / "dp.json"
+    f.write_text(json.dumps(_pack(), ensure_ascii=False), encoding="utf-8")
+    dp = dpk.load(f)
+    led = Ledger(cash=1.0, shares={"1101": 1000})
+    dpk.apply_to_ledger(dp, led)
+    assert led.cash == 135237741.0 and led.shares == {"2330": 73000}  # 只有應收配股的不算持股
+    assert led.accrued_shares == {"6669": 9913} and led.accrued_cash == 1000000.0
+    assert led.asof == "2026-10-27"
+    assert any("違規 1 天" in x for x in dpk.summary_lines(dp))
+
+
+def test_datapack_without_settlement_does_not_touch_ledger(tmp_path):
+    from etf_agent.agent import datapack as dpk
+
+    f = tmp_path / "dp.json"
+    f.write_text(json.dumps(_pack(as_of_date=None, missing=["prev_settlement"], account=None, holdings=None,
+                                  prev_day_orders={"outcome": "unknown", "void_reasons": [], "excluded_codes": []})),
+                 encoding="utf-8")
+    dp = dpk.load(f)
+    led = Ledger(cash=5.0, shares={"1101": 1000})
+    assert not dp.has_positions and dpk.apply_to_ledger(dp, led) == {}
+    assert led.cash == 5.0 and led.shares == {"1101": 1000}
+
+
+def test_datapack_sets_trade_date_and_marks_voided_day(sandbox):
+    md = make_md()
+    inbox = pipeline.INBOX_DIR
+    inbox.mkdir(parents=True)
+    pack = _pack(trade_date="2026-12-02", as_of_date="2026-12-01",
+                 prev_day_orders={"outcome": "voided", "void_reasons": ["insufficient_funds"], "excluded_codes": []},
+                 account={"cash": 1e9, "cash_ratio_tradable": 1.0, "nav_tradable": 1e9, "aum": 1e9,
+                          "receivable_cash": 0.0, "holdings_count": 0}, holdings=[])
+    (inbox / "datapack.json").write_text(json.dumps(pack), encoding="utf-8")
+    d = pipeline.prepare(update=False, md=md, trade_date="2026-12-02", allow_stale=True, holidays=set())
+    ctx = json.loads((d / "context.json").read_text(encoding="utf-8"))
+    assert ctx["trade_date"] == "2026-12-02" and ctx["platform"]["prev_outcome"] == "voided"
+    st = json.loads((pipeline.run_dir("2026-12-01") / "status.json").read_text(encoding="utf-8"))
+    assert st["state"] == "invalid" and st["problems"] == ["insufficient_funds"]
+    assert "整批作廢" in (d / "context.md").read_text(encoding="utf-8")

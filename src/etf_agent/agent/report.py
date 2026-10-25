@@ -27,7 +27,7 @@ def _md_table(df: pd.DataFrame) -> str:
 
 def render_report(ctx: dict, d: Decision, warnings: list[str], adjustments: pd.DataFrame,
                   orders: pd.DataFrame, target: pd.DataFrame, cash: float, nav: float,
-                  problems: list[str], cfg) -> str:
+                  problems: list[str], cfg, conc: dict | None = None) -> str:
     p = ctx["portfolio"]
     source = "Claude（LLM 研究員）" if d.author != "fallback" else "量化基準（未採用 LLM 決策）"
     buys = orders[orders["shares"] > 0]
@@ -44,6 +44,11 @@ def render_report(ctx: dict, d: Decision, warnings: list[str], adjustments: pd.D
         f"- 決策來源：{source}",
         f"- 成交價假設：{cfg.exec_price}（以 {ctx['data_asof']} 收盤價估算股數）",
         "",
+    ]
+    bad = [c for c in ctx.get("health", []) if not c["ok"]]
+    if bad:
+        lines += ["**⚠ 資料健康檢查有未通過項目：**", *[f"- {c['name']}：{c['detail']}" for c in bad], ""]
+    lines += [
         "## 一、市場觀點",
         "",
         f"**風險水位：{RISK_LABEL[d.risk_level]}**（目標投入 {_pct(RISK_LEVELS[d.risk_level])}）",
@@ -97,6 +102,12 @@ def render_report(ctx: dict, d: Decision, warnings: list[str], adjustments: pd.D
     lines += ["", "## 五、交易後目標持股", "",
               _md_table(t[["stock_id", "name", "lots", "權重"]].rename(
                   columns={"stock_id": "代號", "name": "名稱", "lots": "張數"}))]
+
+    if conc:
+        from .diagnostics import render_concentration_md
+
+        names = dict(zip(t["stock_id"], t["name"]))
+        lines += ["", "### 集中度與相關性（交易後）", "", render_concentration_md(conc, names)]
 
     max_other = t.loc[t["stock_id"] != RULES.tsmc_id, "weight"].max() if len(t) else 0.0
     tsmc = t.loc[t["stock_id"] == RULES.tsmc_id, "weight"].sum()

@@ -19,6 +19,22 @@ REVENUE_AVAILABLE_LAG = pd.Timedelta(days=10)
 PAR_VALUE = 10.0  # 股票股利換算配股比例用
 
 
+def industry_map(stock_ids: list[str]) -> pd.Series:
+    """FinMind TaiwanStockInfo 的產業別；同時列在「電子工業」與細分類的取細分類。沒有快取時全部「未分類」。"""
+    from . import store
+
+    out = pd.Series("未分類", index=stock_ids, dtype=object)
+    info = store.read_parquet(store.STOCK_INFO_PATH)
+    if info is None:
+        return out
+    info = info[info["stock_id"].isin(stock_ids)].copy()
+    info["industry_category"] = info["industry_category"].str.replace("類", "業")
+    info["generic"] = info["industry_category"] == "電子工業"
+    best = info.sort_values("generic").drop_duplicates("stock_id").set_index("stock_id")["industry_category"]
+    out.update(best)
+    return out
+
+
 @dataclass
 class MarketData:
     """一次載入、整理好的寬表資料，供回測反覆切片。"""
@@ -32,9 +48,11 @@ class MarketData:
     def __post_init__(self):
         self.stock_ids: list[str] = sorted(self.universe["stock_id"].astype(str))
         p = self.prices[self.prices["stock_id"].isin(self.stock_ids)]
+        if "vwap" not in p.columns:
+            p = p.assign(vwap=(p["high"] + p["low"] + p["close"]) / 3)
         self.panels: dict[str, pd.DataFrame] = {
             f: p.pivot(index="date", columns="stock_id", values=f).sort_index().reindex(columns=self.stock_ids)
-            for f in ("open", "high", "low", "close", "adj_close", "volume")
+            for f in ("open", "high", "low", "close", "adj_close", "volume", "vwap")
         }
         coverage = self.panels["close"].notna().sum(axis=1)
         thin = coverage.index[coverage < 0.5 * len(self.stock_ids)]
@@ -43,6 +61,7 @@ class MarketData:
                           "請重跑 scripts/update_data.py 補齊", stacklevel=2)
             self.panels = {f: df.drop(index=thin) for f, df in self.panels.items()}
         self.dates: pd.DatetimeIndex = self.panels["close"].index
+        self.industry: pd.Series = industry_map(self.stock_ids)
         self.shares: pd.Series = (
             self.universe.set_index("stock_id")["shares"].astype(float).reindex(self.stock_ids)
             if "shares" in self.universe.columns
@@ -124,6 +143,10 @@ class DataView:
     @property
     def shares(self) -> pd.Series:
         return self._md.shares
+
+    @property
+    def industry(self) -> pd.Series:
+        return self._md.industry
 
     def panel(self, field: str = "close", lookback: int | None = None) -> pd.DataFrame:
         """date × stock_id 寬表，只含 asof（含）以前的交易日。lookback 取最後 N 個交易日。"""

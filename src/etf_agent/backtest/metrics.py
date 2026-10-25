@@ -19,5 +19,7 @@ def benchmark_return(bench: pd.DataFrame, start, end, exec_price: str = "open") 
         return float("nan")
     first = b.iloc[0]
     adj = first["adj_close"] / first["close"]
-    entry = first[exec_price] * adj
+    px = first[exec_price] if exec_price in first and pd.notna(first[exec_price]) \
+        else (first["high"] + first["low"] + first["close"]) / 3
+    entry = px * adj
     return float(b["adj_close"].iloc[-1] / entry - 1)
