@@ -58,8 +58,10 @@ def load(path: Path) -> DataPack:
     d = json.loads(Path(path).read_text(encoding="utf-8"))
     if d.get("doc_type") != "DataPack":
         raise DataPackError(f"{path} 不是 DataPack（doc_type={d.get('doc_type')!r}）")
-    if not str(d.get("schema_version", "")).startswith("3."):
-        raise DataPackError(f"不支援的 schema_version {d.get('schema_version')!r}（程式依 3.x 撰寫）")
+    ver = str(d.get("schema_version", ""))
+    if not (ver.startswith("3.") or ver.startswith("4.")):
+        # 規格書範例是 3.0，文件版本是 v4.3；兩者都接受，其他版本才拒絕（欄位不同會讀錯）
+        raise DataPackError(f"不支援的 schema_version {ver!r}（程式依 3.x／4.x 規格撰寫）")
     pdo = d.get("prev_day_orders") or {}
     return DataPack(
         trade_date=d["trade_date"],
@@ -90,6 +92,17 @@ def find_latest(inbox: Path, trade_date: str | None = None) -> DataPack | None:
         if trade_date is None or dp.trade_date == trade_date:
             packs.append(dp)
     return max(packs, key=lambda x: x.generated_at) if packs else None
+
+
+def inbox_errors(inbox: Path) -> list[str]:
+    """inbox 裡讀不了的 JSON 與原因（例如不是資料包、版本不支援、格式錯誤）。"""
+    out = []
+    for p in sorted(inbox.glob("*.json")) if inbox.exists() else []:
+        try:
+            load(p)
+        except (DataPackError, json.JSONDecodeError, KeyError, UnicodeDecodeError) as e:
+            out.append(f"{p.name}：{e}")
+    return out
 
 
 def apply_to_ledger(dp: DataPack, ledger: Ledger) -> dict:

@@ -91,6 +91,29 @@ def submission_window(now: datetime, holidays: set | None = None) -> tuple[str |
     return None, "目前不在任何交易日的繳交窗口（08:55–19:30 之間）"
 
 
+ARCHIVE_ITEMS = ("context.json", "context.md", "decision.json", "decision_validated.json", "dplan_validation.json",
+                 "report.md", "orders.csv", "target_holdings.csv", "status.json", "evidence")
+
+
+def archive_run(d: Path) -> Path | None:
+    """已產生過 D-Plan 的交易日要重跑時，先把整套紀錄複製到 previous/<時間>/（原檔留著供晨間參考）。"""
+    import shutil
+
+    if not any(d.glob("D-Plan_*.json")):
+        return None
+    dst = d / "previous" / f"{datetime.now():%Y%m%d_%H%M%S}_run"
+    dst.mkdir(parents=True, exist_ok=True)
+    for name in ARCHIVE_ITEMS:
+        src = d / name
+        if src.is_dir():
+            shutil.copytree(src, dst / name)
+        elif src.exists():
+            shutil.copy2(src, dst / name)
+    for plan in d.glob("D-Plan_*.json"):
+        shutil.copy2(plan, dst / plan.name)
+    return dst
+
+
 def run_dir(trade_date: str) -> Path:
     return RUNS_DIR / trade_date
 
@@ -215,6 +238,7 @@ def prepare(update: bool = True, cfg: AgentConfig | None = None, md: MarketData 
         trade_date = dp.trade_date
     d = run_dir(trade_date)
     d.mkdir(parents=True, exist_ok=True)
+    archive_run(d)  # 晨間重跑前封存晚間版的完整紀錄，確保每一版 D-Plan 都可重現
 
     checks = run_checks(md, now=now, holidays=holidays, announcements=load_announcements(),
                         check_closures=not allow_stale)
@@ -242,7 +266,11 @@ def prepare(update: bool = True, cfg: AgentConfig | None = None, md: MarketData 
         checks.append(Check("資料包", False, "平台尚無前一交易日結算（missing 含 prev_settlement），改用模擬帳本；"
                                             "結算產生後請重新下載資料包再執行"))
     else:
-        checks.append(Check("資料包", False, f"inbox/ 找不到 {trade_date} 的資料包，帳本使用模擬結算"))
+        bad = dpk.inbox_errors(INBOX_DIR)
+        detail = f"inbox/ 找不到 {trade_date} 的資料包，帳本使用模擬結算"
+        if bad:
+            detail += "；以下檔案無法讀取：" + "；".join(bad)
+        checks.append(Check("資料包", False, detail))
     ledger.save(LEDGER_PATH)
 
     view = md.view(asof)

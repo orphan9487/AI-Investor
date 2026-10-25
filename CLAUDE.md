@@ -40,3 +40,4 @@ python scripts/agent_daily.py compare     # 晨間：與晚間版委託比較
 - Windows 環境：輸出中文的指令加 `PYTHONIOENCODING=utf-8`
 
 - 排程提示詞的版本控管副本在 `docs/scheduled_tasks/`；改提示詞或參數＝改版，要 commit（撰寫指南：提示詞模板也算程式碼）
+- 影子組合（Claude 調整 vs 純量化）：`python scripts/shadow_compare.py`；晨間重跑前整套紀錄會封存到 `runs/<日>/previous/`

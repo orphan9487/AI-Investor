@@ -304,3 +304,36 @@ def test_unknown_team_blocks_finalize(sandbox):
     out = pipeline.finalize(td, md=md, fetch_official=False, cfg=pipeline.AgentConfig(team_id=""))
     st = json.loads((out / "status.json").read_text(encoding="utf-8"))
     assert st["state"] == "blocked" and any("team_id" in p for p in st["problems"])
+
+
+def test_datapack_accepts_schema_4(tmp_path):
+    from etf_agent.agent import datapack as dpk
+
+    f = tmp_path / "dp.json"
+    f.write_text(json.dumps(_pack(schema_version="4.3")), encoding="utf-8")
+    assert dpk.load(f).team_id == "TEAM_042"
+    f.write_text(json.dumps(_pack(schema_version="9.0")), encoding="utf-8")
+    with pytest.raises(dpk.DataPackError):
+        dpk.load(f)
+
+
+def test_rerun_archives_previous_version(sandbox):
+    md = make_md()
+    td = (md.dates[-1] + pd.offsets.BDay(1)).date().isoformat()
+    cfg = pipeline.AgentConfig(team_id="TEAM_TEST")
+    pipeline.prepare(update=False, md=md, trade_date=td, allow_stale=True, holidays=set())
+    pipeline.finalize(td, md=md, fetch_official=False, cfg=cfg)
+    pipeline.prepare(update=False, md=md, trade_date=td, allow_stale=True, holidays=set())   # 晨間重跑
+    snaps = list((pipeline.run_dir(td) / "previous").glob("*_run"))
+    assert len(snaps) == 1
+    assert (snaps[0] / "context.json").exists() and (snaps[0] / "evidence").is_dir()
+    assert (snaps[0] / f"D-Plan_TEAM_TEST_{td}.json").exists()
+
+
+def test_bad_datapack_reason_is_reported(sandbox):
+    md = make_md()
+    pipeline.INBOX_DIR.mkdir(parents=True)
+    (pipeline.INBOX_DIR / "dp.json").write_text(json.dumps(_pack(schema_version="9.9")), encoding="utf-8")
+    d = pipeline.prepare(update=False, md=md, trade_date="2026-12-02", allow_stale=True, holidays=set())
+    health = json.loads((d / "context.json").read_text(encoding="utf-8"))["health"]
+    assert any("dp.json" in c["detail"] and "9.9" in c["detail"] for c in health)
