@@ -34,6 +34,7 @@ def sandbox(tmp_path, monkeypatch):
     monkeypatch.setattr(pipeline, "LEDGER_PATH", tmp_path / "state" / "ledger.json")
     monkeypatch.setattr(pipeline, "INBOX_DIR", tmp_path / "inbox")
     monkeypatch.setattr(pipeline, "TEAM_ID_PATH", tmp_path / "state" / "team_id.txt")
+    monkeypatch.setattr(pipeline, "SHADOW_LEDGER_PATH", tmp_path / "state" / "shadow_ledger.json")
     return tmp_path
 
 
@@ -114,6 +115,8 @@ def test_full_daily_cycle(sandbox):
     d2 = pipeline.prepare(update=False, md=md, trade_date=next_td, allow_stale=True, holidays=set())
     led = pipeline.load_ledger()
     assert len(led.shares) == 25 and 0 < led.cash < 0.05 * RULES.initial_capital
+    sled = Ledger.load(pipeline.SHADOW_LEDGER_PATH)   # 影子帳本也照純量化委託結算
+    assert len(sled.shares) == 25 and any(h["event"] == "close_nav" for h in sled.history)
     assert json.loads((out / "status.json").read_text(encoding="utf-8"))["state"] == "settled"
 
     # Claude 的決策：剔除一檔、加碼一檔
@@ -337,3 +340,31 @@ def test_bad_datapack_reason_is_reported(sandbox):
     d = pipeline.prepare(update=False, md=md, trade_date="2026-12-02", allow_stale=True, holidays=set())
     health = json.loads((d / "context.json").read_text(encoding="utf-8"))["health"]
     assert any("dp.json" in c["detail"] and "9.9" in c["detail"] for c in health)
+
+
+def test_unreadable_datapack_stops_prepare(sandbox):
+    from etf_agent.agent.datapack import DataPackError
+
+    md = make_md()
+    pipeline.INBOX_DIR.mkdir(parents=True)
+    (pipeline.INBOX_DIR / "dp.json").write_text("{not json", encoding="utf-8")
+    with pytest.raises(DataPackError, match="dp.json"):
+        pipeline.prepare(update=False, md=md, trade_date="2026-12-02", holidays=set(),
+                         now=md.dates[-1].to_pydatetime().replace(hour=20))
+
+
+def test_finalize_writes_shadow_and_manifest_and_archive_is_complete(sandbox):
+    md = make_md()
+    td = (md.dates[-1] + pd.offsets.BDay(1)).date().isoformat()
+    cfg = pipeline.AgentConfig(team_id="TEAM_TEST")
+    pipeline.prepare(update=False, md=md, trade_date=td, allow_stale=True, holidays=set())
+    out = pipeline.finalize(td, md=md, fetch_official=False, cfg=cfg)
+    shadow = json.loads((out / "shadow.json").read_text(encoding="utf-8"))
+    assert len(shadow["target_weights"]) == 25 and shadow["orders"]
+    man = json.loads((out / "run_manifest.json").read_text(encoding="utf-8"))
+    assert man["code_version"] and man["strategy"]["tsmc_weight"] == 0.22 and "rules" in man
+    pipeline.prepare(update=False, md=md, trade_date=td, allow_stale=True, holidays=set())
+    snap = next((out / "previous").glob("*_run"))
+    copied = {p.name for p in snap.iterdir()}
+    original = {p.name for p in out.iterdir() if p.name != "previous"}
+    assert original <= copied | {"log.jsonl"} and "shadow.json" in copied and "run_manifest.json" in copied

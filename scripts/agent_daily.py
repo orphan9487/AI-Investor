@@ -59,6 +59,7 @@ def main() -> None:
         pipeline.LEDGER_PATH = ROOT / "dryrun" / "state" / "ledger.json"
         pipeline.INBOX_DIR = ROOT / "dryrun" / "inbox"
         pipeline.TEAM_ID_PATH = ROOT / "dryrun" / "state" / "team_id.txt"
+        pipeline.SHADOW_LEDGER_PATH = ROOT / "dryrun" / "state" / "shadow_ledger.json"
         print("[dry-run] 使用 dryrun/，不影響正式紀錄")
 
     if args.cmd == "prepare":
@@ -67,6 +68,8 @@ def main() -> None:
                                  allow_stale=args.allow_stale, datapack_path=args.datapack)
         except pipeline.StaleDataError as e:
             sys.exit(f"❌ 資料健康檢查未通過，已停止：{e}")
+        except pipeline.DataPackError as e:
+            sys.exit(f"❌ {e}")
         ctx = json.loads((d / "context.json").read_text(encoding="utf-8"))
         print(f"交易日 {ctx['trade_date']}（資料截至 {ctx['data_asof']}）")
         print(f"淨值 {ctx['portfolio']['nav']:,.0f}，累積 {ctx['portfolio']['return_since_start']:+.2%}")

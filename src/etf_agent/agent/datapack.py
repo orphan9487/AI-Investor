@@ -94,6 +94,13 @@ def find_latest(inbox: Path, trade_date: str | None = None) -> DataPack | None:
     return max(packs, key=lambda x: x.generated_at) if packs else None
 
 
+def file_sha256(path) -> str | None:
+    import hashlib
+
+    p = Path(path)
+    return hashlib.sha256(p.read_bytes()).hexdigest() if p.exists() else None
+
+
 def inbox_errors(inbox: Path) -> list[str]:
     """inbox 裡讀不了的 JSON 與原因（例如不是資料包、版本不支援、格式錯誤）。"""
     out = []
@@ -122,7 +129,8 @@ def apply_to_ledger(dp: DataPack, ledger: Ledger) -> dict:
 
 def summary_lines(dp: DataPack) -> list[str]:
     """給 context／報告用的重點摘要。"""
-    lines = [f"資料包產生時間 {dp.generated_at}，部位截至 {dp.as_of_date or '（尚無結算）'}"]
+    lines = [f"資料包 schema {dp.schema_version}｜隊伍 {dp.team_id}｜交易日 {dp.trade_date}｜"
+             f"部位截至 {dp.as_of_date or '（尚無結算）'}｜產生於 {dp.generated_at}"]
     if dp.missing:
         lines.append(f"⚠️ 平台缺少資料：{', '.join(dp.missing)}")
     outcome = {"none": "前一交易日未繳交", "unknown": "前一交易日委託結果尚未判定",

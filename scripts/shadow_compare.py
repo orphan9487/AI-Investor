@@ -38,6 +38,15 @@ def actual_nav() -> pd.Series:
     return pd.Series(rows, dtype=float).sort_index()
 
 
+def shadow_ledger_nav() -> pd.Series:
+    """影子帳本每天記錄的收盤淨值（每天用當時保存的純量化委託結算，可精準歸因）。"""
+    if not pipeline.SHADOW_LEDGER_PATH.exists():
+        return pd.Series(dtype=float)
+    hist = json.loads(pipeline.SHADOW_LEDGER_PATH.read_text(encoding="utf-8")).get("history", [])
+    rows = {pd.Timestamp(h["date"]): h["nav"] for h in hist if h.get("event") == "close_nav"}
+    return pd.Series(rows, dtype=float).sort_index()
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--start", default="2026-10-27")
@@ -48,7 +57,10 @@ def main() -> None:
     end = md.dates[-1]
     if pd.Timestamp(args.start) > end:
         sys.exit("比賽還沒開始累積資料")
-    shadow = run_backtest(md, CompositeScore(), args.start, end, BacktestConfig()).daily["nav"]
+    shadow = shadow_ledger_nav()
+    if shadow.empty:
+        print("（影子帳本還沒有資料，暫用同期回測近似純量化組合）")
+        shadow = run_backtest(md, CompositeScore(), args.start, end, BacktestConfig()).daily["nav"]
 
     df = pd.DataFrame({"actual": act, "pure_quant": shadow}).dropna(how="all")
     df["actual_ret"] = df["actual"] / RULES.initial_capital - 1

@@ -25,6 +25,7 @@ from ..rules import RULES, check_portfolio
 from ..strategies.composite import CompositeScore
 from .decision import CANDIDATE_RANK, apply_decision, fallback, parse_decision
 from .diagnostics import concentration, render_concentration_md
+from .datapack import DataPackError
 from .health import Check, StaleDataError, render_checks_md, run_checks
 from .ledger import Ledger
 
@@ -32,6 +33,7 @@ RUNS_DIR = store.PROJECT_ROOT / "runs"
 INBOX_DIR = store.PROJECT_ROOT / "inbox"  # 從後台下載的資料包放這裡
 LEDGER_PATH = store.PROJECT_ROOT / "state" / "ledger.json"
 TEAM_ID_PATH = store.PROJECT_ROOT / "state" / "team_id.txt"
+SHADOW_LEDGER_PATH = store.PROJECT_ROOT / "state" / "shadow_ledger.json"  # 純量化影子組合的獨立帳本
 
 COMPETITION_START = pd.Timestamp("2026-10-26")
 COMPETITION_END = pd.Timestamp("2026-11-27")
@@ -91,26 +93,15 @@ def submission_window(now: datetime, holidays: set | None = None) -> tuple[str |
     return None, "目前不在任何交易日的繳交窗口（08:55–19:30 之間）"
 
 
-ARCHIVE_ITEMS = ("context.json", "context.md", "decision.json", "decision_validated.json", "dplan_validation.json",
-                 "report.md", "orders.csv", "target_holdings.csv", "status.json", "evidence")
-
-
 def archive_run(d: Path) -> Path | None:
-    """已產生過 D-Plan 的交易日要重跑時，先把整套紀錄複製到 previous/<時間>/（原檔留著供晨間參考）。"""
+    """已產生過 D-Plan 的交易日要重跑時，先把整個 run 目錄原封不動複製到 previous/<時間>_run/
+    （previous/ 本身除外；原檔留著供晨間參考）。"""
     import shutil
 
     if not any(d.glob("D-Plan_*.json")):
         return None
     dst = d / "previous" / f"{datetime.now():%Y%m%d_%H%M%S}_run"
-    dst.mkdir(parents=True, exist_ok=True)
-    for name in ARCHIVE_ITEMS:
-        src = d / name
-        if src.is_dir():
-            shutil.copytree(src, dst / name)
-        elif src.exists():
-            shutil.copy2(src, dst / name)
-    for plan in d.glob("D-Plan_*.json"):
-        shutil.copy2(plan, dst / plan.name)
+    shutil.copytree(d, dst, ignore=lambda folder, names: ["previous"] if Path(folder) == d else [])
     return dst
 
 
@@ -234,6 +225,10 @@ def prepare(update: bool = True, cfg: AgentConfig | None = None, md: MarketData 
     trade_date = trade_date or target_trade_date(now or datetime.now(), holidays).date().isoformat()
     # 資料包的 trade_date 是平台指定的決策日，最權威
     dp = dpk.load(datapack_path) if datapack_path else dpk.find_latest(INBOX_DIR, trade_date)
+    if dp is None and not allow_stale:
+        bad = dpk.inbox_errors(INBOX_DIR)
+        if bad:  # 有資料包卻讀不了：不可默默改用模擬帳本
+            raise dpk.DataPackError("inbox/ 有無法讀取的資料包，已停止：" + "；".join(bad))
     if dp is not None and dp.trade_date != trade_date:
         trade_date = dp.trade_date
     d = run_dir(trade_date)
@@ -250,6 +245,7 @@ def prepare(update: bool = True, cfg: AgentConfig | None = None, md: MarketData 
 
     ledger = load_ledger()
     settled = settle_pending(md, ledger, cfg)
+    settle_shadow(md, cfg)
     dp_diff = None
     if dp is not None and dp.team_id:  # 記住隊伍代號，之後沒有資料包的日子也能產生正確檔名
         TEAM_ID_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -349,6 +345,8 @@ def prepare(update: bool = True, cfg: AgentConfig | None = None, md: MarketData 
             "notices": dp.compliance.get("notices", 0), "incidents": dp.compliance.get("incidents", []),
             "summary": dpk.summary_lines(dp), "ledger_diff": dp_diff,
             "team_id": dp.team_id,
+            "schema_version": dp.schema_version, "trade_date": dp.trade_date,
+            "source": dp.source, "sha256": dpk.file_sha256(dp.source),
             "nav_tradable": (dp.account or {}).get("nav_tradable"),
             "cash": (dp.account or {}).get("cash"),
             "holdings": dp.holdings,
@@ -362,7 +360,10 @@ def prepare(update: bool = True, cfg: AgentConfig | None = None, md: MarketData 
     (d / "context.md").write_text(render_context_md(ctx), encoding="utf-8")
     _write_status(trade_date, state="prepared", data_asof=ctx["data_asof"])
     _log(trade_date, "prepared", data_asof=ctx["data_asof"], nav=nav, settled=settled,
-         context_sha=_sha(d / "context.json"))
+         context_sha=_sha(d / "context.json"),
+         datapack={"source": dp.source, "sha256": dpk.file_sha256(dp.source), "schema_version": dp.schema_version,
+                   "team_id": dp.team_id, "trade_date": dp.trade_date, "as_of_date": dp.as_of_date}
+         if dp is not None else None)
     return d
 
 
@@ -496,6 +497,7 @@ def finalize(trade_date: str, cfg: AgentConfig | None = None, md: MarketData | N
         warnings.append(decision.notes)
 
     final, adjustments = apply_decision(decision, base, candidates)
+    shadow_final, _ = apply_decision(fallback(trade_date, "影子組合：純量化"), base, candidates)
 
     # 下單股數以最新收盤價估算；壓力測試：開盤全面上漲 stress_gap 時現金仍要夠
     orders = build_orders(ledger.shares, final, close, close, ledger.cash, band=cfg.band)
@@ -563,6 +565,25 @@ def finalize(trade_date: str, cfg: AgentConfig | None = None, md: MarketData | N
         (d / "previous").mkdir(exist_ok=True)
         old.replace(d / "previous" / f"{datetime.now():%Y%m%d_%H%M%S}_{old.name}")
     plan_path.write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    # 影子組合（純量化，不含 Claude 調整）：同一套下單規則，永久保存當天的目標與委託
+    sled = Ledger.load(SHADOW_LEDGER_PATH) if SHADOW_LEDGER_PATH.exists() else Ledger.new()
+    shadow_orders = build_orders(sled.shares, shadow_final, close, close, sled.cash, band=cfg.band)
+    sc = 1.0
+    while _stress_cash(sled, shadow_orders, close, cfg.stress_gap) < 0 and sc > 0.8:
+        sc -= 0.005
+        shadow_orders = build_orders(sled.shares, shadow_final * sc, close, close, sled.cash, band=cfg.band)
+    shadow_post = {s: n for s, n in ((s, sled.shares.get(s, 0) + shadow_orders.get(s, 0))
+                                     for s in set(sled.shares) | set(shadow_orders)) if n}
+    (d / "shadow.json").write_text(json.dumps({
+        "description": "純量化影子組合：同一份資料與下單規則，但不套用 Claude 的調整；委託從影子帳本出發",
+        "shadow_ledger_asof": sled.asof, "shadow_cash": sled.cash,
+        "target_weights": {s: round(float(w), 6) for s, w in shadow_final.items()},
+        "orders": shadow_orders, "post_shares": shadow_post,
+        "actual_target_weights": {s: round(float(w), 6) for s, w in final.items()},
+        "actual_orders": orders,
+    }, ensure_ascii=False, indent=2), encoding="utf-8")
+    write_manifest(d, ctx, cfg, plan, plan_path)
     dpl.save_evidence(d / "evidence", plan, md, asof, close, ctx)
     (d / "dplan_validation.json").write_text(
         json.dumps({"errors": dp_errors, "warnings": dp_warnings, "n_orders": len(plan["orders"]),
@@ -587,6 +608,65 @@ def finalize(trade_date: str, cfg: AgentConfig | None = None, md: MarketData | N
     _log(trade_date, "finalized", state=state, author=decision.author, n_orders=len(order_df),
          problems=problems, orders_sha=_sha(d / "orders.csv"), dplan=plan_path.name, dplan_sha=_sha(plan_path))
     return d
+
+
+def settle_shadow(md: MarketData, cfg: AgentConfig) -> Ledger:
+    """影子帳本：用各交易日 shadow.json 的委託，以同樣的成交均價、作廢規則與除權息處理結算，
+    並記錄每天收盤淨值，供 shadow_compare 與實際淨值比較。"""
+    led = Ledger.load(SHADOW_LEDGER_PATH) if SHADOW_LEDGER_PATH.exists() else Ledger.new()
+    last = md.dates[-1]
+    since = pd.Timestamp(led.asof) if led.asof else md.dates[0] - pd.Timedelta(days=1)
+    events, universe = md.dividend_events, set(md.stock_ids)
+    close_ff = md.panels["close"].ffill()
+    for d in [x for x in md.dates if since < x <= last]:
+        ds = d.date().isoformat()
+        if led.shares and not events.empty:
+            led.accrue_dividends(events[events["ex_date"] == d], ds)
+        f = run_dir(ds) / "shadow.json"
+        if f.exists():
+            orders = json.loads(f.read_text(encoding="utf-8"))["orders"]
+            if orders:
+                df = pd.DataFrame([{"stock_id": s, "shares": n} for s, n in orders.items()])
+                before = led.snapshot()
+                led.apply_fills(df, md.panels[cfg.exec_price].loc[d], md.panels["volume"].loc[d], ds)
+                if day_violations(led, before, close_ff.loc[d], universe):
+                    led.restore(before)
+        if led.shares or led.history:
+            led.history.append({"date": ds, "event": "close_nav", "nav": led.nav(close_ff.loc[d]),
+                                "final_nav": led.final_nav(close_ff.loc[d])})
+    led.asof = last.date().isoformat()
+    led.save(SHADOW_LEDGER_PATH)
+    return led
+
+
+def write_manifest(d: Path, ctx: dict, cfg: AgentConfig, plan: dict, plan_path: Path) -> None:
+    """可重播所需的版本與輸入指紋：程式版本、設定、資料包與資料快照的雜湊。"""
+    from dataclasses import asdict
+
+    def sha(path: Path) -> str | None:
+        return hashlib.sha256(path.read_bytes()).hexdigest() if path.exists() else None
+
+    data_files = [store.PRICES_PATH, store.BENCHMARK_PATH, store.DATA_DIR / "vwap_official.parquet",
+                  store.DATA_DIR / "splits.parquet", store.DATA_DIR / "calendar.parquet",
+                  store.DATA_DIR / "announcements.parquet", store.UNIVERSE_OFFICIAL_PATH]
+    strat = cfg.make_strategy()
+    manifest = {
+        "trade_date": ctx["trade_date"],
+        "data_asof": ctx["data_asof"],
+        "code_version": plan["agent_metadata"]["code_version"],
+        "model_version": cfg.model_version,
+        "agent_config": {k: v for k, v in asdict(cfg).items() if k != "strategy"},
+        "strategy": {k: v for k, v in vars(strat).items() if not k.startswith("_")},
+        "rules": asdict(RULES),
+        "datapack": {k: (ctx.get("platform") or {}).get(k)
+                     for k in ("source", "sha256", "schema_version", "team_id", "trade_date", "as_of_date")},
+        "data_snapshot_sha256": {p.name: sha(p) for p in data_files},
+        "playbook_sha256": sha(store.PROJECT_ROOT / "docs" / "daily_agent_playbook.md"),
+        "outputs_sha256": {plan_path.name: sha(plan_path), "shadow.json": sha(d / "shadow.json"),
+                           "decision.json": sha(d / "decision.json")},
+    }
+    (d / "run_manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2, default=str),
+                                         encoding="utf-8")
 
 
 def _cash_flow(orders: dict[str, int], prices: pd.Series, gap: float = 0.0) -> float:
