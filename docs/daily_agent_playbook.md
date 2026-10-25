@@ -7,7 +7,21 @@
 
 工作目錄：`C:\programming\esun-etf-agent`
 
+## 執行時段（方案 C）
+
+- **晚間（20:30）**：產出當晚版 D-Plan，讓使用者睡前上傳保底。
+- **晨間（06:30）**：加入隔夜美股、台積電 ADR、台指期夜盤等資訊重新評估；委託有變動才請使用者重新上傳
+  （每天可送出 25 次，以 08:55 前最後一次為準）。
+
 ## 步驟
+
+### 0. 確認是否在繳交窗口
+
+```bash
+python scripts/agent_daily.py window
+```
+
+結束代碼為 1（不在任何交易日的繳交窗口，例如週五晚上、休市日前一晚、週末早上）就**直接結束**，回報一句「今天不需執行」即可。
 
 ### 1. 準備
 
@@ -144,10 +158,31 @@ finalize 會產出 `runs/<交易日>/dplan.json`（要上傳的檔案），並�
   修不好就刪掉 decision.json 再跑一次（退回量化基準）。**blocked 的 D-Plan 不可以上傳。**
 - 讀 `runs/<交易日>/decision_validated.json` 的 `warnings`，確認你的調整都被採用；被丟棄的要想清楚原因。
 
+### 晨間額外步驟
+
+晨間執行時，步驟 3 之外還要查隔夜市場（`mcp-tv-get-symbol-data-batch`，欄位用 `close`、`change`）：
+`NASDAQ:SOX`、`NASDAQ:NDX`、`SP:SPX`、`NYSE:TSM`；台指期夜盤可用 `mcp-tv-search-symbols` 搜尋「台指期」或 `TXF`。
+把有用的數字寫成 observations（authority 用 `vendor`，url 填 TradingView 的商品頁，content_as_of 填美東收盤對應的台北時間），
+放進 `market_basis`。
+
+只有隔夜出現明顯訊號才改變決策（例如費半或台積電 ADR 單日漲跌超過 2–3%、夜盤大幅跳空）；沒有就沿用晚間的調整。
+finalize 之後執行：
+
+```bash
+python scripts/agent_daily.py compare
+```
+
+- 「完全相同，不需要重新上傳」：晚間版仍然有效，告訴使用者不用動作。
+- 「委託有變動」：請使用者在 08:55 前上傳新的 `dplan.json` 並送出。
+
 ### 8. 回報
 
 最後的回覆用繁體中文簡短說明：交易日、風險水位、做了哪些調整與理由、委託筆數、
 **`dplan.json` 的路徑（提醒使用者上傳並按「送出繳交」）**、`report.md` 的路徑，以及任何警告或錯誤。
+
+**通知使用者**（使用者可能不在電腦前）：如果有 `SendUserFile` 工具，把 `dplan.json` 傳給使用者
+（status 用 `proactive`），說明是晚間版還是晨間更新版、是否需要上傳、截止時間 08:55；
+如果有 `PushNotification` 工具，也發一則簡短推播。狀態是 `blocked`、資料包缺漏或流程失敗時更要通知。
 
 ## 不可以做的事
 

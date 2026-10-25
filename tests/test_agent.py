@@ -277,3 +277,17 @@ def test_datapack_sets_trade_date_and_marks_voided_day(sandbox):
     st = json.loads((pipeline.run_dir("2026-12-01") / "status.json").read_text(encoding="utf-8"))
     assert st["state"] == "invalid" and st["problems"] == ["insufficient_funds"]
     assert "整批作廢" in (d / "context.md").read_text(encoding="utf-8")
+
+
+def test_submission_window():
+    from datetime import datetime
+
+    hol = {pd.Timestamp("2026-10-26")}
+    w = pipeline.submission_window
+    assert w(datetime(2026, 10, 26, 20, 30), hol)[0] == "2026-10-27"   # 休市日晚上，明天交易
+    assert w(datetime(2026, 10, 25, 20, 30), hol)[0] is None           # 週日晚上，但 10/26 休市
+    assert w(datetime(2026, 11, 1, 20, 30), hol)[0] == "2026-11-02"    # 一般週日晚上 → 週一
+    assert w(datetime(2026, 10, 30, 20, 30), hol)[0] is None           # 週五晚上
+    assert w(datetime(2026, 10, 27, 6, 30), hol)[0] == "2026-10-27"    # 交易日早上
+    assert w(datetime(2026, 10, 31, 6, 30), hol)[0] is None            # 週六早上
+    assert w(datetime(2026, 10, 27, 12, 0), hol)[0] is None            # 盤中

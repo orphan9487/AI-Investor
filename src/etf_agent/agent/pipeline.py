@@ -67,6 +67,29 @@ def target_trade_date(now: datetime, holidays: set | None = None) -> pd.Timestam
     return next_trading_day(today, holidays)
 
 
+SUBMIT_OPEN = (19, 30)  # 交易日「前一日」19:30 開放繳交
+
+
+def submission_window(now: datetime, holidays: set | None = None) -> tuple[str | None, str]:
+    """現在是否在某個交易日的繳交窗口內。回傳 (交易日或 None, 說明)。
+    窗口：交易日前一天（日曆日）19:30 ～ 交易日 08:55。"""
+    from ..data.exchange import twse_holidays
+
+    holidays = twse_holidays() if holidays is None else holidays
+    today = pd.Timestamp(now.date())
+    is_trading = lambda d: d.weekday() < 5 and d not in holidays
+    if (now.hour, now.minute) < SUBMIT_CUTOFF:
+        if is_trading(today):
+            return today.date().isoformat(), f"晨間：今天 {today.date()} 是交易日，08:55 截止"
+        return None, f"今天 {today.date()} 不是交易日"
+    tomorrow = today + pd.Timedelta(days=1)
+    if (now.hour, now.minute) >= SUBMIT_OPEN:
+        if is_trading(tomorrow):
+            return tomorrow.date().isoformat(), f"晚間：明天 {tomorrow.date()} 是交易日，窗口已開放"
+        return None, f"明天 {tomorrow.date()} 不是交易日"
+    return None, "目前不在任何交易日的繳交窗口（08:55–19:30 之間）"
+
+
 def run_dir(trade_date: str) -> Path:
     return RUNS_DIR / trade_date
 
@@ -499,6 +522,9 @@ def finalize(trade_date: str, cfg: AgentConfig | None = None, md: MarketData | N
                                           float(dp_cash), set(md.stock_ids))
     warnings += dp_warnings
     problems += [f"D-Plan：{e}" for e in dp_errors]
+    prev_plan = d / "dplan.json"
+    if prev_plan.exists():  # 晨間重跑時保留前一版（例如晚間版），供比對與稽核
+        prev_plan.replace(d / f"dplan_{datetime.now():%Y%m%d_%H%M%S}.json")
     (d / "dplan.json").write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
     (d / "dplan_validation.json").write_text(
         json.dumps({"errors": dp_errors, "warnings": dp_warnings, "n_orders": len(plan["orders"]),

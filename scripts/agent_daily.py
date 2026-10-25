@@ -47,6 +47,8 @@ def main() -> None:
     f = sub.add_parser("finalize")
     f.add_argument("--trade-date")
     sub.add_parser("status")
+    sub.add_parser("window", help="現在是否在繳交窗口；不在時結束代碼為 1")
+    sub.add_parser("compare", help="比較本交易日最新 D-Plan 與前一版的委託")
     r = sub.add_parser("reconcile")
     r.add_argument("holdings_csv", help="欄位 stock_id, shares")
     r.add_argument("--cash", type=float, required=True)
@@ -83,6 +85,33 @@ def main() -> None:
             print(f"  ❌ {prob}")
         print(f"D-Plan（上傳這個）：{d / 'dplan.json'}")
         print(f"人讀報告：{d / 'report.md'}")
+
+    elif args.cmd == "window":
+        from datetime import datetime
+
+        td, why = pipeline.submission_window(datetime.now())
+        print(why)
+        if td is None:
+            sys.exit(1)
+        print(f"交易日 {td}")
+
+    elif args.cmd == "compare":
+        td = latest_prepared()
+        d = pipeline.RUNS_DIR / td
+        olds = sorted(d.glob("dplan_*.json"))
+        if not (d / "dplan.json").exists() or not olds:
+            sys.exit(f"{td}：沒有可比較的前一版 D-Plan")
+        key = lambda p: {(o["ticker"], o["side"], o["shares"])
+                         for o in json.loads(p.read_text(encoding="utf-8"))["orders"]}
+        new, old = key(d / "dplan.json"), key(olds[-1])
+        if new == old:
+            print(f"{td}：委託與前一版（{olds[-1].name}）完全相同，不需要重新上傳")
+        else:
+            print(f"{td}：委託有變動，需要重新上傳並送出")
+            for x in sorted(old - new):
+                print(f"  - 移除 {x}")
+            for x in sorted(new - old):
+                print(f"  + 新增 {x}")
 
     elif args.cmd == "status":
         led = pipeline.load_ledger()
