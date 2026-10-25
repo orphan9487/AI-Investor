@@ -30,11 +30,15 @@ def make_md(n_days=90, seed=0):
 
 @pytest.fixture
 def sandbox(tmp_path, monkeypatch):
-    monkeypatch.setattr(pipeline, "RUNS_DIR", tmp_path / "runs")
-    monkeypatch.setattr(pipeline, "LEDGER_PATH", tmp_path / "state" / "ledger.json")
-    monkeypatch.setattr(pipeline, "INBOX_DIR", tmp_path / "inbox")
-    monkeypatch.setattr(pipeline, "TEAM_ID_PATH", tmp_path / "state" / "team_id.txt")
-    monkeypatch.setattr(pipeline, "SHADOW_LEDGER_PATH", tmp_path / "state" / "shadow_ledger.json")
+    """把 pipeline 裡所有指向專案資料夾的路徑（runs/、state/、inbox/…）自動導到暫存資料夾，
+    新增路徑常數時不會漏掉，測試永遠不會寫進正式紀錄。"""
+    from pathlib import Path
+
+    root = pipeline.store.PROJECT_ROOT
+    for name in dir(pipeline):
+        val = getattr(pipeline, name)
+        if isinstance(val, Path) and val.is_relative_to(root) and name.isupper():
+            monkeypatch.setattr(pipeline, name, tmp_path / val.relative_to(root))
     return tmp_path
 
 
@@ -100,7 +104,7 @@ def test_full_daily_cycle(sandbox):
     ctx = json.loads((d / "context.json").read_text(encoding="utf-8"))
     assert ctx["data_asof"] == day1.date().isoformat()
     assert len(ctx["base_portfolio"]) == 25
-    out = pipeline.finalize(ctx["trade_date"], md=md1, fetch_official=False, cfg=pipeline.AgentConfig(team_id="TEAM_TEST"))
+    out = pipeline.finalize(ctx["trade_date"], md=md1, fetch_official=False, cfg=pipeline.AgentConfig(team_id="TEAM_TEST", require_datapack=False))
     st = json.loads((out / "status.json").read_text(encoding="utf-8"))
     assert st["state"] == "final" and st["author"] == "fallback"
     orders = pd.read_csv(out / "orders.csv", dtype={"stock_id": str})
@@ -128,7 +132,7 @@ def test_full_daily_cycle(sandbox):
         "tilts": [{"stock_id": held[1], "multiplier": 1.3, "reason": "測試加碼理由"}],
         "author": "claude",
     }, ensure_ascii=False), encoding="utf-8")
-    out2 = pipeline.finalize(next_td, md=md, fetch_official=False, cfg=pipeline.AgentConfig(team_id="TEAM_TEST"))
+    out2 = pipeline.finalize(next_td, md=md, fetch_official=False, cfg=pipeline.AgentConfig(team_id="TEAM_TEST", require_datapack=False))
     st2 = json.loads((out2 / "status.json").read_text(encoding="utf-8"))
     assert st2["state"] == "final" and st2["author"] == "claude"
     tgt = pd.read_csv(out2 / "target_holdings.csv", dtype={"stock_id": str})
@@ -304,7 +308,7 @@ def test_unknown_team_blocks_finalize(sandbox):
     md = make_md()
     td = (md.dates[-1] + pd.offsets.BDay(1)).date().isoformat()
     pipeline.prepare(update=False, md=md, trade_date=td, allow_stale=True, holidays=set())
-    out = pipeline.finalize(td, md=md, fetch_official=False, cfg=pipeline.AgentConfig(team_id=""))
+    out = pipeline.finalize(td, md=md, fetch_official=False, cfg=pipeline.AgentConfig(team_id="", require_datapack=False))
     st = json.loads((out / "status.json").read_text(encoding="utf-8"))
     assert st["state"] == "blocked" and any("team_id" in p for p in st["problems"])
 
@@ -323,7 +327,7 @@ def test_datapack_accepts_schema_4(tmp_path):
 def test_rerun_archives_previous_version(sandbox):
     md = make_md()
     td = (md.dates[-1] + pd.offsets.BDay(1)).date().isoformat()
-    cfg = pipeline.AgentConfig(team_id="TEAM_TEST")
+    cfg = pipeline.AgentConfig(team_id="TEAM_TEST", require_datapack=False)
     pipeline.prepare(update=False, md=md, trade_date=td, allow_stale=True, holidays=set())
     pipeline.finalize(td, md=md, fetch_official=False, cfg=cfg)
     pipeline.prepare(update=False, md=md, trade_date=td, allow_stale=True, holidays=set())   # 晨間重跑
@@ -356,7 +360,7 @@ def test_unreadable_datapack_stops_prepare(sandbox):
 def test_finalize_writes_shadow_and_manifest_and_archive_is_complete(sandbox):
     md = make_md()
     td = (md.dates[-1] + pd.offsets.BDay(1)).date().isoformat()
-    cfg = pipeline.AgentConfig(team_id="TEAM_TEST")
+    cfg = pipeline.AgentConfig(team_id="TEAM_TEST", require_datapack=False)
     pipeline.prepare(update=False, md=md, trade_date=td, allow_stale=True, holidays=set())
     out = pipeline.finalize(td, md=md, fetch_official=False, cfg=cfg)
     shadow = json.loads((out / "shadow.json").read_text(encoding="utf-8"))

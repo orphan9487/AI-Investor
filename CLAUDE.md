@@ -41,3 +41,8 @@ python scripts/agent_daily.py compare     # 晨間：與晚間版委託比較
 
 - 排程提示詞的版本控管副本在 `docs/scheduled_tasks/`；改提示詞或參數＝改版，要 commit（撰寫指南：提示詞模板也算程式碼）
 - 影子組合（Claude 調整 vs 純量化）：`python scripts/shadow_compare.py`；晨間重跑前整套紀錄會封存到 `runs/<日>/previous/`
+- 正式模式（非 `--dry-run`）必須有當天、同隊伍、已結算的資料包，否則擋下；被擋下的 D-Plan 存成 `DO_NOT_SUBMIT_…`
+- 獨立檢查：`python scripts/check_dplan.py <D-Plan> <資料包>`（刻意不引用 etf_agent，避免與產生器共用錯誤）
+- 三條績效曲線：純量化模擬（`state/shadow_ledger.json`）、量化＋LLM 模擬（`state/llm_sim_ledger.json`）、平台實際；
+  `scripts/shadow_compare.py` 輸出 LLM 效果與執行差異（同一資產口徑：可交易淨值）
+- 測試的 `sandbox` fixture 會自動把 pipeline 所有專案路徑導到暫存資料夾；新增路徑常數請用全大寫命名

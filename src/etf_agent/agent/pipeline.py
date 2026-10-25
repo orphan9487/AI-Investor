@@ -34,6 +34,7 @@ INBOX_DIR = store.PROJECT_ROOT / "inbox"  # 從後台下載的資料包放這裡
 LEDGER_PATH = store.PROJECT_ROOT / "state" / "ledger.json"
 TEAM_ID_PATH = store.PROJECT_ROOT / "state" / "team_id.txt"
 SHADOW_LEDGER_PATH = store.PROJECT_ROOT / "state" / "shadow_ledger.json"  # 純量化影子組合的獨立帳本
+LLM_SIM_LEDGER_PATH = store.PROJECT_ROOT / "state" / "llm_sim_ledger.json"  # 實際委託（含 LLM）以同一成交模型模擬
 
 COMPETITION_START = pd.Timestamp("2026-10-26")
 COMPETITION_END = pd.Timestamp("2026-11-27")
@@ -49,6 +50,9 @@ class AgentConfig:
     stress_gap: float = 0.05
     strategy: CompositeScore | None = None
     model_version: str = os.environ.get("ETF_AGENT_MODEL", "claude-opus-5-5")  # D-Plan agent_metadata
+    # 正式模式：必須有當天、同一隊伍、已結算的資料包，且決策標的都要有交易所收盤價；
+    # 演練（--dry-run）才允許用帳本估算淨值
+    require_datapack: bool = True
     team_id: str = os.environ.get("ETF_TEAM_ID", "")  # 有資料包時以資料包為準
 
     def make_strategy(self) -> CompositeScore:
@@ -441,6 +445,10 @@ def _table(rows: list[dict]) -> str:
 
 # ---------------------------------------------------------------- finalize
 
+def no_official_decisions(missing: set[str], orders: dict[str, int]) -> list[str]:
+    return sorted(s for s in orders if s in missing)
+
+
 def official_close(asof: pd.Timestamp, stock_ids: list[str], fallback: pd.Series) -> tuple[pd.Series, list[str]]:
     """交易所公布的 T-1 收盤價（主辦方推導委託用的價格）。查不到的用 fallback 並回報。"""
     from ..data.exchange import tpex_daily_quotes, twse_daily_quotes
@@ -466,10 +474,12 @@ def finalize(trade_date: str, cfg: AgentConfig | None = None, md: MarketData | N
     ledger = load_ledger()
     data_warnings = []
     taiex = None
+    close_missing: set[str] = set()
     if fetch_official:
         from ..data.exchange import twse_taiex
 
         close, no_official = official_close(asof, md.stock_ids, close)
+        close_missing = set(no_official)
         held_missing = [s for s in no_official if s in ledger.shares]
         if held_missing:
             data_warnings.append(f"查不到交易所 {asof.date()} 收盤價、改用資料源價格：{held_missing}")
@@ -538,8 +548,16 @@ def finalize(trade_date: str, cfg: AgentConfig | None = None, md: MarketData | N
     dp_nav = platform.get("nav_tradable") or (ledger.cash + sum(n * float(close[s]) for s, n in ledger.shares.items()))
     dp_cash = platform.get("cash") if platform.get("cash") is not None else ledger.cash
     if not platform.get("nav_tradable"):
-        warnings.append("沒有資料包的 nav_tradable，D-Plan 改用帳本估算的淨值；與平台不同時委託推導會不一致，"
-                        "請下載資料包後重跑 prepare")
+        msg = ("沒有當天已結算的資料包（nav_tradable），委託推導可能與平台不一致；"
+               "請到後台下載資料包放進 inbox/ 後重跑 prepare")
+        (problems.append if cfg.require_datapack else warnings.append)(msg)
+    elif platform.get("trade_date") and platform["trade_date"] != trade_date:
+        problems.append(f"資料包的交易日 {platform['trade_date']} 與本次 {trade_date} 不同")
+    stored_team = TEAM_ID_PATH.read_text(encoding="utf-8").strip() if TEAM_ID_PATH.exists() else ""
+    if platform.get("team_id") and cfg.team_id and platform["team_id"] != cfg.team_id:
+        problems.append(f"資料包隊伍 {platform['team_id']} 與設定的 ETF_TEAM_ID {cfg.team_id} 不同")
+    if cfg.require_datapack and fetch_official and no_official_decisions(close_missing, orders):
+        problems.append(f"下列委託標的查不到交易所前日收盤價，無法依官方公式推導：{no_official_decisions(close_missing, orders)}")
     team_id = platform.get("team_id") or cfg.team_id or         (TEAM_ID_PATH.read_text(encoding="utf-8").strip() if TEAM_ID_PATH.exists() else "")
     if not team_id:
         warnings.append("沒有 team_id（資料包或環境變數 ETF_TEAM_ID），D-Plan 暫填 TEAM_UNKNOWN")
@@ -551,6 +569,21 @@ def finalize(trade_date: str, cfg: AgentConfig | None = None, md: MarketData | N
         markets=markets, names=names.to_dict(), taiex=taiex, team_id=team_id,
         model_version=cfg.model_version, run_started_at=dpl.ts(ctx["generated"]),
     )
+    # 意圖獨立檢查：研究階段的風險水位決定預期投入比例；委託結果偏離時記錄原因（不覆蓋 D-Plan 的宣告）
+    from .decision import RISK_LEVELS
+
+    planned_cash = 1 - RISK_LEVELS[decision.risk_level]
+    intent_lo, intent_hi = max(0.0, planned_cash - 0.01), min(0.25, planned_cash + cfg.stress_gap + 0.01)
+    est_cash_ratio = dpl.estimated_cash(float(dp_cash), plan["orders"], {s: float(v) for s, v in close.items()
+                                                                         if pd.notna(v)}) / float(dp_nav)
+    intent_check = {"risk_level": decision.risk_level, "planned_cash_range": [round(intent_lo, 4), round(intent_hi, 4)],
+                    "order_cash_ratio": round(est_cash_ratio, 4),
+                    "declared_posture": plan["market_view"]["posture"]}
+    if not intent_lo <= est_cash_ratio <= intent_hi:
+        reason = "壓力測試下修投入比例" if any("壓力測試" in w for w in warnings) else "整張取整或部位遲滯"
+        warnings.append(f"委託後現金比 {est_cash_ratio:.2%} 不在研究階段預期區間 "
+                        f"[{intent_lo:.2%}, {intent_hi:.2%}]（風險水位 {decision.risk_level}）；可能原因：{reason}")
+        intent_check["mismatch_reason"] = reason
     dp_errors, dp_warnings = dpl.validate(plan, dict(ledger.shares), float(dp_nav),
                                           {s: float(v) for s, v in close.items() if pd.notna(v)},
                                           float(dp_cash), set(md.stock_ids))
@@ -560,10 +593,12 @@ def finalize(trade_date: str, cfg: AgentConfig | None = None, md: MarketData | N
     problems += [f"D-Plan：{e}" for e in dp_errors]
     # 官方檔名：D-Plan_<team_id>_<trade_date>.json（同日重繳用同一檔名）。
     # 重跑時前一版（例如晚間版）移到 previous/，供比對與稽核
-    plan_path = d / dpl.plan_filename(team_id, trade_date)
-    for old in d.glob("D-Plan_*.json"):
+    official_name = dpl.plan_filename(team_id, trade_date)
+    for old in list(d.glob("D-Plan_*.json")) + list(d.glob("DO_NOT_SUBMIT_*.json")):
         (d / "previous").mkdir(exist_ok=True)
         old.replace(d / "previous" / f"{datetime.now():%Y%m%d_%H%M%S}_{old.name}")
+    # 有任何問題就不使用官方檔名，避免被誤傳
+    plan_path = d / (official_name if not problems else f"DO_NOT_SUBMIT_{official_name}")
     plan_path.write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
 
     # 影子組合（純量化，不含 Claude 調整）：同一套下單規則，永久保存當天的目標與委託
@@ -582,6 +617,7 @@ def finalize(trade_date: str, cfg: AgentConfig | None = None, md: MarketData | N
         "orders": shadow_orders, "post_shares": shadow_post,
         "actual_target_weights": {s: round(float(w), 6) for s, w in final.items()},
         "actual_orders": orders,
+        "actual_post_shares": post,
     }, ensure_ascii=False, indent=2), encoding="utf-8")
     write_manifest(d, ctx, cfg, plan, plan_path)
     dpl.save_evidence(d / "evidence", plan, md, asof, close, ctx)
@@ -591,7 +627,8 @@ def finalize(trade_date: str, cfg: AgentConfig | None = None, md: MarketData | N
                    ensure_ascii=False, indent=2), encoding="utf-8")
 
     (d / "decision_validated.json").write_text(
-        json.dumps({"decision": decision.to_dict(), "warnings": warnings}, ensure_ascii=False, indent=2),
+        json.dumps({"decision": decision.to_dict(), "warnings": warnings, "intent_check": intent_check},
+                   ensure_ascii=False, indent=2),
         encoding="utf-8")
 
     from .report import render_report
@@ -611,9 +648,17 @@ def finalize(trade_date: str, cfg: AgentConfig | None = None, md: MarketData | N
 
 
 def settle_shadow(md: MarketData, cfg: AgentConfig) -> Ledger:
-    """影子帳本：用各交易日 shadow.json 的委託，以同樣的成交均價、作廢規則與除權息處理結算，
-    並記錄每天收盤淨值，供 shadow_compare 與實際淨值比較。"""
-    led = Ledger.load(SHADOW_LEDGER_PATH) if SHADOW_LEDGER_PATH.exists() else Ledger.new()
+    """兩本模擬帳本，用同一套成交模型（成交均價、作廢規則、除權息累積）結算：
+    - 純量化：shadow.json 的 orders（影子帳本自己的持股出發）
+    - 量化＋LLM：shadow.json 的 actual_orders 改以「目標持股」重算，從 LLM 模擬帳本自己的持股出發
+    兩者之差＝LLM 調整的效果；量化＋LLM 模擬與平台實際之差＝執行／結算差異。"""
+    _settle_sim(md, cfg, SHADOW_LEDGER_PATH, "orders")
+    _settle_sim(md, cfg, LLM_SIM_LEDGER_PATH, "actual_post_shares")
+    return Ledger.load(SHADOW_LEDGER_PATH)
+
+
+def _settle_sim(md: MarketData, cfg: AgentConfig, path: Path, key: str) -> Ledger:
+    led = Ledger.load(path) if path.exists() else Ledger.new()
     last = md.dates[-1]
     since = pd.Timestamp(led.asof) if led.asof else md.dates[0] - pd.Timedelta(days=1)
     events, universe = md.dividend_events, set(md.stock_ids)
@@ -624,7 +669,13 @@ def settle_shadow(md: MarketData, cfg: AgentConfig) -> Ledger:
             led.accrue_dividends(events[events["ex_date"] == d], ds)
         f = run_dir(ds) / "shadow.json"
         if f.exists():
-            orders = json.loads(f.read_text(encoding="utf-8"))["orders"]
+            payload = json.loads(f.read_text(encoding="utf-8"))
+            if key == "actual_post_shares":  # 讓模擬帳本追蹤實際決策的目標持股，而非平台帳本的委託差額
+                tgt = payload.get(key) or {}
+                orders = {s: tgt.get(s, 0) - led.shares.get(s, 0) for s in set(tgt) | set(led.shares)}
+                orders = {s: n for s, n in orders.items() if n}
+            else:
+                orders = payload.get(key) or {}
             if orders:
                 df = pd.DataFrame([{"stock_id": s, "shares": n} for s, n in orders.items()])
                 before = led.snapshot()
@@ -635,8 +686,21 @@ def settle_shadow(md: MarketData, cfg: AgentConfig) -> Ledger:
             led.history.append({"date": ds, "event": "close_nav", "nav": led.nav(close_ff.loc[d]),
                                 "final_nav": led.final_nav(close_ff.loc[d])})
     led.asof = last.date().isoformat()
-    led.save(SHADOW_LEDGER_PATH)
+    led.save(path)
     return led
+
+
+def _dependency_versions() -> dict:
+    import platform as _pf
+    from importlib.metadata import PackageNotFoundError, version
+
+    out = {"python": _pf.python_version()}
+    for pkg in ("pandas", "numpy", "yfinance", "jsonschema", "pyarrow", "requests"):
+        try:
+            out[pkg] = version(pkg)
+        except PackageNotFoundError:
+            out[pkg] = None
+    return out
 
 
 def write_manifest(d: Path, ctx: dict, cfg: AgentConfig, plan: dict, plan_path: Path) -> None:
@@ -662,6 +726,7 @@ def write_manifest(d: Path, ctx: dict, cfg: AgentConfig, plan: dict, plan_path: 
                      for k in ("source", "sha256", "schema_version", "team_id", "trade_date", "as_of_date")},
         "data_snapshot_sha256": {p.name: sha(p) for p in data_files},
         "playbook_sha256": sha(store.PROJECT_ROOT / "docs" / "daily_agent_playbook.md"),
+        "dependencies": _dependency_versions(),
         "outputs_sha256": {plan_path.name: sha(plan_path), "shadow.json": sha(d / "shadow.json"),
                            "decision.json": sha(d / "decision.json")},
     }

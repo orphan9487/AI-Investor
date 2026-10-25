@@ -1,11 +1,14 @@
-"""影子組合比較：實際（量化＋Claude 調整，平台結算淨值）vs 純量化（同期回測）。
+"""三條績效曲線（同一資產口徑：可交易淨值＝現金＋持股×收盤，不含應收配息／配股）：
 
-  python scripts/shadow_compare.py                  # 從 2026-10-27 比到最新
+  1. 純量化模擬      state/shadow_ledger.json   ← 策略基準
+  2. 量化＋LLM 模擬  state/llm_sim_ledger.json  ← 與 1 用同一成交模型；2 − 1 ＝ LLM 調整的效果
+  3. 平台實際        資料包 account.nav_tradable ← 3 − 2 ＝ 平台執行／結算與我們模擬的差異
+
+  python scripts/shadow_compare.py
   python scripts/shadow_compare.py --start 2026-10-27
 
-實際淨值取自每天 context.json 記錄的平台資料包（account.nav_tradable，as_of_date 收盤）。
-純量化淨值用同一套回測引擎（成交均價、手續費與證交稅、整張）跑 CompositeScore。
-兩者執行細節不完全相同（例如壓力測試保留的現金），差異約在 0.1–0.3% 等級，解讀時要考慮。
+模擬帳本還沒有資料時，純量化改用同期回測近似（會標示出來）。
+比賽只有 24 個交易日，LLM 效果的正負在統計上很難下定論，解讀時要保守。
 """
 from __future__ import annotations
 
@@ -29,7 +32,8 @@ from etf_agent.rules import RULES  # noqa: E402
 from etf_agent.strategies.composite import CompositeScore  # noqa: E402
 
 
-def actual_nav() -> pd.Series:
+def platform_nav() -> pd.Series:
+    """平台實際可交易淨值：每天 context.json 記錄的資料包 account.nav_tradable（as_of_date 收盤）。"""
     rows = {}
     for ctx_path in sorted(pipeline.RUNS_DIR.glob("*/context.json")) if pipeline.RUNS_DIR.exists() else []:
         plat = json.loads(ctx_path.read_text(encoding="utf-8")).get("platform") or {}
@@ -38,11 +42,11 @@ def actual_nav() -> pd.Series:
     return pd.Series(rows, dtype=float).sort_index()
 
 
-def shadow_ledger_nav() -> pd.Series:
-    """影子帳本每天記錄的收盤淨值（每天用當時保存的純量化委託結算，可精準歸因）。"""
-    if not pipeline.SHADOW_LEDGER_PATH.exists():
+def ledger_nav(path: Path) -> pd.Series:
+    """模擬帳本每天記錄的收盤可交易淨值（不含累積中的除權息）。"""
+    if not path.exists():
         return pd.Series(dtype=float)
-    hist = json.loads(pipeline.SHADOW_LEDGER_PATH.read_text(encoding="utf-8")).get("history", [])
+    hist = json.loads(path.read_text(encoding="utf-8")).get("history", [])
     rows = {pd.Timestamp(h["date"]): h["nav"] for h in hist if h.get("event") == "close_nav"}
     return pd.Series(rows, dtype=float).sort_index()
 
@@ -52,30 +56,41 @@ def main() -> None:
     ap.add_argument("--start", default="2026-10-27")
     args = ap.parse_args()
 
-    act = actual_nav()
     md = MarketData.load()
     end = md.dates[-1]
     if pd.Timestamp(args.start) > end:
         sys.exit("比賽還沒開始累積資料")
-    shadow = shadow_ledger_nav()
-    if shadow.empty:
-        print("（影子帳本還沒有資料，暫用同期回測近似純量化組合）")
-        shadow = run_backtest(md, CompositeScore(), args.start, end, BacktestConfig()).daily["nav"]
 
-    df = pd.DataFrame({"actual": act, "pure_quant": shadow}).dropna(how="all")
-    df["actual_ret"] = df["actual"] / RULES.initial_capital - 1
-    df["quant_ret"] = df["pure_quant"] / RULES.initial_capital - 1
-    df["llm_value_added"] = df["actual_ret"] - df["quant_ret"]
+    pure = ledger_nav(pipeline.SHADOW_LEDGER_PATH)
+    if pure.empty:
+        print("（純量化模擬帳本還沒有資料，暫用同期回測近似）")
+        pure = run_backtest(md, CompositeScore(), args.start, end, BacktestConfig()).daily["nav"]
+    curves = {"pure_quant": pure, "quant_llm_sim": ledger_nav(pipeline.LLM_SIM_LEDGER_PATH),
+              "platform": platform_nav()}
+    df = pd.DataFrame(curves).dropna(how="all")
+    for c in curves:
+        df[c + "_ret"] = df[c] / RULES.initial_capital - 1
+    df["llm_effect"] = df["quant_llm_sim_ret"] - df["pure_quant_ret"]      # 同一成交模型下的 LLM 效果
+    df["execution_gap"] = df["platform_ret"] - df["quant_llm_sim_ret"]    # 平台與我們模擬的差異
+
     out = ROOT / "output" / "shadow_compare.csv"
     out.parent.mkdir(exist_ok=True)
     df.to_csv(out, encoding="utf-8-sig")
-    show = df[["actual_ret", "quant_ret", "llm_value_added"]].map(lambda v: "" if pd.isna(v) else f"{v:+.2%}")
+    cols = ["pure_quant_ret", "quant_llm_sim_ret", "platform_ret", "llm_effect", "execution_gap"]
+    show = df[cols].map(lambda v: "" if pd.isna(v) else f"{v:+.2%}")
     show.index = [d.date() for d in show.index]
     print(show.to_string())
-    last = df.dropna().tail(1)
-    if not last.empty:
-        print(f"\n截至 {last.index[0].date()}：Claude 調整的貢獻 {last['llm_value_added'].iloc[0]:+.2%}"
-              f"（實際 {last['actual_ret'].iloc[0]:+.2%} vs 純量化 {last['quant_ret'].iloc[0]:+.2%}）")
+
+    eff = df["llm_effect"].dropna()
+    if not eff.empty:
+        d0 = eff.index[-1]
+        line = f"截至 {d0.date()}：LLM 調整效果 {eff.iloc[-1]:+.2%}（同一成交模型）"
+        gap = df.at[d0, "execution_gap"]
+        if pd.notna(gap):
+            line += f"；平台與模擬差異 {gap:+.2%}"
+        print()
+        print(line)
+    print("注意：比賽只有 24 天，樣本很小，LLM 效果的正負在統計上很難下定論。")
     print(f"明細：{out}")
 
 

@@ -161,7 +161,10 @@ python scripts/agent_daily.py finalize
 finalize 會產出 `runs/<交易日>/D-Plan_<team_id>_<交易日>.json`（要上傳的檔案，官方檔名規約；同日重繳同一檔名），並模擬主辦方的收件檢核
 （schema、引用鏈、決策覆蓋、委託推導、部位宣告、現金比、持股檔數），結果在 `dplan_validation.json`。
 
-- 狀態 `final`：完成，檢核全數通過。
+- 狀態 `final`：檢核全數通過。**接著一定要跑獨立檢查**（另一套不共用程式碼的重算）：
+  `python scripts/check_dplan.py runs/<交易日>/D-Plan_<team_id>_<交易日>.json inbox/<資料包檔名>.json`
+  顯示「✅ 獨立檢查全部通過」才通知使用者上傳；顯示「❌」就當作 blocked 處理並回報錯誤。
+- 被擋下時檔名會是 `DO_NOT_SUBMIT_D-Plan_…json`，**絕對不要**把它傳給使用者或請使用者上傳。
 - 狀態 `blocked`：有檢核錯誤。讀 `report.md` 與 `dplan_validation.json` 的錯誤，修正 decision.json 後重跑；
   修不好就刪掉 decision.json 再跑一次（退回量化基準）。**blocked 的 D-Plan 不可以上傳。**
 - 讀 `runs/<交易日>/decision_validated.json` 的 `warnings`，確認你的調整都被採用；被丟棄的要想清楚原因。

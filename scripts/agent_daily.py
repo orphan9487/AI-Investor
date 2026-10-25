@@ -60,6 +60,7 @@ def main() -> None:
         pipeline.INBOX_DIR = ROOT / "dryrun" / "inbox"
         pipeline.TEAM_ID_PATH = ROOT / "dryrun" / "state" / "team_id.txt"
         pipeline.SHADOW_LEDGER_PATH = ROOT / "dryrun" / "state" / "shadow_ledger.json"
+        pipeline.LLM_SIM_LEDGER_PATH = ROOT / "dryrun" / "state" / "llm_sim_ledger.json"
         print("[dry-run] 使用 dryrun/，不影響正式紀錄")
 
     if args.cmd == "prepare":
@@ -82,13 +83,17 @@ def main() -> None:
 
     elif args.cmd == "finalize":
         td = args.trade_date or latest_prepared()
-        d = pipeline.finalize(td)
+        # 演練允許沒有資料包（用帳本估算淨值）；正式模式一定要有
+        d = pipeline.finalize(td, cfg=pipeline.AgentConfig(require_datapack=not args.dry_run))
         st = json.loads((d / "status.json").read_text(encoding="utf-8"))
         print(f"交易日 {td}：{st['state']}，決策來源 {st['author']}，委託 {st['n_orders']} 筆")
         for prob in st.get("problems", []):
             print(f"  ❌ {prob}")
         plans = sorted(d.glob("D-Plan_*.json"))
-        print(f"D-Plan（上傳這個）：{plans[-1] if plans else '（未產生）'}")
+        if plans:
+            print(f"D-Plan（上傳這個）：{plans[-1]}")
+        else:
+            print("⛔ 沒有可上傳的 D-Plan（有問題的版本存成 DO_NOT_SUBMIT_…，不要上傳）")
         print(f"人讀報告：{d / 'report.md'}")
 
     elif args.cmd == "window":

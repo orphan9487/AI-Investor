@@ -434,16 +434,54 @@ def validate(dp: dict, prev_shares: dict[str, int], nav: float, close: dict[str,
             errors.append(f"{d['ticker']} 不在 150 檔標的池")
 
     # 推導一致
-    missing_px = [d["ticker"] for d in dp["decisions"] if d["ticker"] not in close]
+    missing_px = [d["ticker"] for d in dp["decisions"] if not (close.get(d["ticker"]) or 0) > 0]
     if missing_px:
         errors.append(f"缺前日收盤價：{missing_px}")
         return errors, warnings
-    derived = {(o["ticker"], o["side"], o["shares"]) for o in derive_orders(dp["decisions"], prev_shares, nav, close)}
-    given = {(o["ticker"], o["side"], o["shares"]) for o in dp["orders"]}
-    for x in sorted(derived - given):
-        errors.append(f"推導不一致：官方推導有 {x}，orders 沒有")
-    for x in sorted(given - derived):
-        errors.append(f"推導不一致：orders 有 {x}，官方推導沒有")
+    # 推導比對用「多重集合」：同一檔重複委託不能被集合吃掉
+    from collections import Counter
+
+    derived = Counter((o["ticker"], o["side"], o["shares"], o["decision_ref"])
+                      for o in derive_orders(dp["decisions"], prev_shares, nav, close))
+    given = Counter((o["ticker"], o["side"], o["shares"], o["decision_ref"]) for o in dp["orders"])
+    for x in sorted((derived - given).elements()):
+        errors.append(f"推導不一致：官方推導有 {x[:3]}（{x[3]}），orders 沒有")
+    for x in sorted((given - derived).elements()):
+        errors.append(f"推導不一致：orders 有 {x[:3]}（{x[3]}），官方推導沒有")
+    tick = Counter(o["ticker"] for o in dp["orders"])
+    for t, n in tick.items():
+        if n > 1:
+            errors.append(f"委託重複：{t} 出現 {n} 筆")
+    dec_by_id = {d["decision_id"]: d for d in dp["decisions"]}
+    for o in dp["orders"]:
+        d = dec_by_id.get(o["decision_ref"])
+        if d is None:
+            continue
+        if d["ticker"] != o["ticker"]:
+            errors.append(f"委託 {o['ticker']} 引用的 {d['decision_id']} 是 {d['ticker']}")
+        want = "BUY" if d["action"] in ("BUY", "ADD") else "SELL"
+        if o["side"] != want:
+            errors.append(f"委託 {o['ticker']} 方向 {o['side']} 與決策動作 {d['action']} 不符")
+    ordered = Counter(o["decision_ref"] for o in dp["orders"])
+    for d in dp["decisions"]:
+        if ordered.get(d["decision_id"], 0) == 0:
+            errors.append(f"決策 {d['decision_id']} {d['ticker']} 推導後沒有委託（應改列 no_trade_decisions）")
+
+    # funding_for：①指向同日 BUY/ADD ②本身是 TRIM/SELL_ALL ③拿掉調度賣出後現金會跌破宣告下限
+    funding = [d for d in dp["decisions"] if d.get("funding_for")]
+    for d in funding:
+        if d["action"] not in ("TRIM", "SELL_ALL"):
+            errors.append(f"funding_for 只能用在 TRIM/SELL_ALL，{d['decision_id']} 是 {d['action']}")
+        for ref in d["funding_for"]:
+            tgt = dec_by_id.get(ref)
+            if tgt is None or tgt["action"] not in ("BUY", "ADD"):
+                errors.append(f"{d['decision_id']} 的 funding_for 指向 {ref}，不是同日的 BUY/ADD 決策")
+    if funding:
+        ids = {d["decision_id"] for d in funding}
+        without = [o for o in dp["orders"] if o["decision_ref"] not in ids]
+        lo = dp["market_view"]["posture"]["target_cash_pct_range"][0]
+        if estimated_cash(cash, without, close) / nav >= lo:
+            errors.append("funding_for 宣告的資金缺口不存在：拿掉調度賣出後現金比仍不低於宣告下限")
 
     # 部位宣告與委託一致
     flow = net_flow(dp["orders"], close)
