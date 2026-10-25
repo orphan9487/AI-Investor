@@ -66,8 +66,17 @@ def main() -> None:
     OUT_DIR.mkdir(exist_ok=True)
     out_docx = OUT_DIR / "ETF投資策略說明文件.docx"
     out_pdf = OUT_DIR / "ETF投資策略說明文件.pdf"
-    fill(d, out_docx)
-    to_pdf(out_docx, out_pdf)
+    try:
+        fill(d, out_docx)
+        to_pdf(out_docx, out_pdf)
+    except (PermissionError, OSError) as e:
+        # 舊檔被開著（例如 Word 或 PDF 閱讀器）：改用帶時間的新檔名，不去關使用者的程式
+        stamp = __import__("datetime").datetime.now().strftime("%Y%m%d_%H%M")
+        out_docx = OUT_DIR / f"ETF投資策略說明文件_{stamp}.docx"
+        out_pdf = OUT_DIR / f"ETF投資策略說明文件_{stamp}.pdf"
+        print(f"原檔被其他程式開啟（{type(e).__name__}），改存新檔名")
+        fill(d, out_docx)
+        to_pdf(out_docx, out_pdf)
     print(f"名稱 {len(d['etf_name'])} 字／主題 {len(d['theme'])} 字／理念 {len(d['philosophy'])} 字，皆符合規定")
     print(f"PDF：{out_pdf}")
 
