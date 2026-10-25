@@ -1,0 +1,6 @@
+pandas>=2.2
+numpy
+pyarrow
+requests
+yfinance>=0.2.40
+pytest

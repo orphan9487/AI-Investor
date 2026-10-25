@@ -1,0 +1,11 @@
+# 下載的資料與執行產物（只排除專案根目錄，不影響 src/etf_agent/data/ 程式碼）
+/data/
+/output/
+/runs/
+/state/
+/dryrun/
+
+__pycache__/
+*.pyc
+.pytest_cache/
+.env
