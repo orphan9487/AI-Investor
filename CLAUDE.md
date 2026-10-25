@@ -10,11 +10,11 @@ AI CUP 2026 玉山人工智慧公開挑戰賽「Agent 基金經理人」。初�
 python scripts/agent_daily.py window      # 不在繳交窗口（前一日 19:30～當日 08:55）就結束
 python scripts/agent_daily.py prepare     # 讀 inbox/ 資料包對帳、量化選股 → runs/<交易日>/context.md
 # Claude 寫 runs/<交易日>/decision.json（格式見手冊步驟 6）
-python scripts/agent_daily.py finalize    # → runs/<交易日>/dplan.json（使用者上傳）、report.md
+python scripts/agent_daily.py finalize    # → runs/<交易日>/D-Plan_<team_id>_<交易日>.json（官方檔名，使用者上傳）、report.md
 python scripts/agent_daily.py compare     # 晨間：與晚間版委託比較
 ```
 
-使用者每天手動：後台下載資料包放 `inbox/`、上傳 `dplan.json` 並按「送出繳交」。
+使用者每天手動：後台下載資料包放 `inbox/`、上傳 `D-Plan_<team_id>_<交易日>.json` 並按「送出繳交」。
 
 ## 結構
 
@@ -38,3 +38,5 @@ python scripts/agent_daily.py compare     # 晨間：與晚間版委託比較
 - 資料在 `data/`（不進 git）；更新：`python scripts/update_data.py`
 - 改程式後 commit，D-Plan 的 `code_version` 才是乾淨版本（12/2 要交程式碼審查）
 - Windows 環境：輸出中文的指令加 `PYTHONIOENCODING=utf-8`
+
+- 排程提示詞的版本控管副本在 `docs/scheduled_tasks/`；改提示詞或參數＝改版，要 commit（撰寫指南：提示詞模板也算程式碼）

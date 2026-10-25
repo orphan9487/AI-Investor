@@ -43,6 +43,40 @@ SOURCE_URLS = {
 }
 
 
+def plan_filename(team_id: str, trade_date: str) -> str:
+    """官方檔名規約：D-Plan_<team_id>_<trade_date>.json（只用 A-Z a-z 0-9 _ -，不帶時間戳）。"""
+    return f"D-Plan_{team_id}_{trade_date}.json"
+
+
+def save_evidence(folder: Path, plan: dict, md, asof, close, ctx: dict) -> None:
+    """留存 observations 用到的原始數據（主辦方會抽檢數字是否對得上來源）。"""
+    folder.mkdir(parents=True, exist_ok=True)
+    tickers = sorted({d["ticker"] for d in plan["decisions"]} | {n["ticker"] for n in plan["no_trade_decisions"]})
+    tickers = [t for t in tickers if t in md.stock_ids]
+    asof = pd.Timestamp(asof)
+    win = md.panels["close"].loc[:asof].iloc[-70:].index
+    prices = pd.concat({f: md.panels[f].loc[win, tickers] for f in ("close", "adj_close", "volume", "vwap")},
+                       names=["field"]).stack(future_stack=True).rename("value").reset_index()
+    prices.to_csv(folder / "prices_last70d.csv", index=False, encoding="utf-8-sig")
+    pd.Series({t: float(close[t]) for t in tickers}, name="official_close_prev").rename_axis("stock_id") \
+        .to_csv(folder / "official_close_prev.csv", encoding="utf-8-sig")
+    if not md.revenue.empty:
+        rev = md.revenue[md.revenue["stock_id"].isin(tickers)].sort_values(["stock_id", "date"])
+        rev.groupby("stock_id").tail(16).to_csv(folder / "monthly_revenue.csv", index=False, encoding="utf-8-sig")
+    if not md.institutional.empty:
+        ins = md.institutional[md.institutional["stock_id"].isin(tickers)]
+        ins = ins[pd.to_datetime(ins["date"]) > asof - pd.Timedelta(days=40)]
+        ins.to_csv(folder / "institutional_40d.csv", index=False, encoding="utf-8-sig")
+    rows = {r["stock_id"]: r for r in ctx["base_portfolio"] + ctx["reserve_candidates"] + ctx["held_not_in_base"]}
+    (folder / "factor_rows.json").write_text(json.dumps({t: rows.get(t) for t in tickers}, ensure_ascii=False,
+                                                        indent=1, default=str), encoding="utf-8")
+    (folder / "README.txt").write_text(
+        "observations 的數值來源：收盤價＝交易所前日收盤（official_close_prev.csv）；"
+        "近 60 日報酬＝adj_close（含除權息還原）第 -6 天 / 第 -66 天 - 1；"
+        "營收年增＝monthly_revenue.csv 最近 3 期與去年同月比的平均；"
+        "法人＝institutional_40d.csv 外資＋投信最近 20 個交易日淨買超 / 發行股數。\n", encoding="utf-8")
+
+
 def ts(dt: datetime | pd.Timestamp | str, hhmm: str | None = None) -> str:
     """台北時間 ISO-8601（+08:00）。"""
     t = pd.Timestamp(dt)
@@ -349,6 +383,12 @@ def validate(dp: dict, prev_shares: dict[str, int], nav: float, close: dict[str,
 
     S, O, I, D = (ids(dp["sources"], "source_id"), ids(dp["observations"], "obs_id"),
                   ids(dp["inferences"], "inf_id"), ids(dp["decisions"], "decision_id"))
+    # 撰寫指南：流水號從 1 開始、連續遞增、不跳號、不加前導零
+    for items, key, prefix in ((dp["sources"], "source_id", "S"), (dp["observations"], "obs_id", "O"),
+                               (dp["inferences"], "inf_id", "I"), (dp["decisions"], "decision_id", "D")):
+        expect = [f"{prefix}{i}" for i in range(1, len(items) + 1)]
+        if [x[key] for x in items] != expect:
+            errors.append(f"{key} 必須依序為 {prefix}1…{prefix}{len(items)}（連號、不跳號、不加前導零）")
     for o in dp["observations"]:
         for r in o["source_ref"]:
             if r not in S:

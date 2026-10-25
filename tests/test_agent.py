@@ -33,6 +33,7 @@ def sandbox(tmp_path, monkeypatch):
     monkeypatch.setattr(pipeline, "RUNS_DIR", tmp_path / "runs")
     monkeypatch.setattr(pipeline, "LEDGER_PATH", tmp_path / "state" / "ledger.json")
     monkeypatch.setattr(pipeline, "INBOX_DIR", tmp_path / "inbox")
+    monkeypatch.setattr(pipeline, "TEAM_ID_PATH", tmp_path / "state" / "team_id.txt")
     return tmp_path
 
 
@@ -98,12 +99,15 @@ def test_full_daily_cycle(sandbox):
     ctx = json.loads((d / "context.json").read_text(encoding="utf-8"))
     assert ctx["data_asof"] == day1.date().isoformat()
     assert len(ctx["base_portfolio"]) == 25
-    out = pipeline.finalize(ctx["trade_date"], md=md1, fetch_official=False)
+    out = pipeline.finalize(ctx["trade_date"], md=md1, fetch_official=False, cfg=pipeline.AgentConfig(team_id="TEAM_TEST"))
     st = json.loads((out / "status.json").read_text(encoding="utf-8"))
     assert st["state"] == "final" and st["author"] == "fallback"
     orders = pd.read_csv(out / "orders.csv", dtype={"stock_id": str})
     assert (orders["shares"] % 1000 == 0).all() and (orders["shares"] > 0).all()
     assert "合規檢查" in (out / "report.md").read_text(encoding="utf-8")
+    plan_file = out / f"D-Plan_TEAM_TEST_{ctx['trade_date']}.json"     # 官方檔名規約
+    assert plan_file.exists() and json.loads(plan_file.read_text(encoding="utf-8"))["team_id"] == "TEAM_TEST"
+    assert (out / "evidence" / "official_close_prev.csv").exists()
 
     # 第二天：資料多一天 → 結算前一次委託，帳本有持股
     next_td = (day2 + pd.offsets.BDay(1)).date().isoformat()
@@ -121,7 +125,7 @@ def test_full_daily_cycle(sandbox):
         "tilts": [{"stock_id": held[1], "multiplier": 1.3, "reason": "測試加碼理由"}],
         "author": "claude",
     }, ensure_ascii=False), encoding="utf-8")
-    out2 = pipeline.finalize(next_td, md=md, fetch_official=False)
+    out2 = pipeline.finalize(next_td, md=md, fetch_official=False, cfg=pipeline.AgentConfig(team_id="TEAM_TEST"))
     st2 = json.loads((out2 / "status.json").read_text(encoding="utf-8"))
     assert st2["state"] == "final" and st2["author"] == "claude"
     tgt = pd.read_csv(out2 / "target_holdings.csv", dtype={"stock_id": str})
@@ -291,3 +295,12 @@ def test_submission_window():
     assert w(datetime(2026, 10, 27, 6, 30), hol)[0] == "2026-10-27"    # 交易日早上
     assert w(datetime(2026, 10, 31, 6, 30), hol)[0] is None            # 週六早上
     assert w(datetime(2026, 10, 27, 12, 0), hol)[0] is None            # 盤中
+
+
+def test_unknown_team_blocks_finalize(sandbox):
+    md = make_md()
+    td = (md.dates[-1] + pd.offsets.BDay(1)).date().isoformat()
+    pipeline.prepare(update=False, md=md, trade_date=td, allow_stale=True, holidays=set())
+    out = pipeline.finalize(td, md=md, fetch_official=False, cfg=pipeline.AgentConfig(team_id=""))
+    st = json.loads((out / "status.json").read_text(encoding="utf-8"))
+    assert st["state"] == "blocked" and any("team_id" in p for p in st["problems"])

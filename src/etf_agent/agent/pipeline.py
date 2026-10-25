@@ -31,6 +31,7 @@ from .ledger import Ledger
 RUNS_DIR = store.PROJECT_ROOT / "runs"
 INBOX_DIR = store.PROJECT_ROOT / "inbox"  # 從後台下載的資料包放這裡
 LEDGER_PATH = store.PROJECT_ROOT / "state" / "ledger.json"
+TEAM_ID_PATH = store.PROJECT_ROOT / "state" / "team_id.txt"
 
 COMPETITION_START = pd.Timestamp("2026-10-26")
 COMPETITION_END = pd.Timestamp("2026-11-27")
@@ -226,6 +227,9 @@ def prepare(update: bool = True, cfg: AgentConfig | None = None, md: MarketData 
     ledger = load_ledger()
     settled = settle_pending(md, ledger, cfg)
     dp_diff = None
+    if dp is not None and dp.team_id:  # 記住隊伍代號，之後沒有資料包的日子也能產生正確檔名
+        TEAM_ID_PATH.parent.mkdir(parents=True, exist_ok=True)
+        TEAM_ID_PATH.write_text(dp.team_id, encoding="utf-8")
     if dp is not None and dp.has_positions:
         # 平台的真實結算覆蓋模擬結算；模擬與平台的差異留紀錄
         dp_diff = dpk.apply_to_ledger(dp, ledger)
@@ -427,7 +431,7 @@ def finalize(trade_date: str, cfg: AgentConfig | None = None, md: MarketData | N
     cfg = cfg or AgentConfig()
     d = run_dir(trade_date)
     ctx = json.loads((d / "context.json").read_text(encoding="utf-8"))
-    md = md or MarketData.load(with_finmind=False)
+    md = md or MarketData.load()  # 含營收與法人：證據快照要用
     asof = pd.Timestamp(ctx["data_asof"])
     close = md.view(asof).last("close")
     ledger = load_ledger()
@@ -506,7 +510,7 @@ def finalize(trade_date: str, cfg: AgentConfig | None = None, md: MarketData | N
     if not platform.get("nav_tradable"):
         warnings.append("沒有資料包的 nav_tradable，D-Plan 改用帳本估算的淨值；與平台不同時委託推導會不一致，"
                         "請下載資料包後重跑 prepare")
-    team_id = platform.get("team_id") or cfg.team_id
+    team_id = platform.get("team_id") or cfg.team_id or         (TEAM_ID_PATH.read_text(encoding="utf-8").strip() if TEAM_ID_PATH.exists() else "")
     if not team_id:
         warnings.append("沒有 team_id（資料包或環境變數 ETF_TEAM_ID），D-Plan 暫填 TEAM_UNKNOWN")
         team_id = "TEAM_UNKNOWN"
@@ -520,12 +524,18 @@ def finalize(trade_date: str, cfg: AgentConfig | None = None, md: MarketData | N
     dp_errors, dp_warnings = dpl.validate(plan, dict(ledger.shares), float(dp_nav),
                                           {s: float(v) for s, v in close.items() if pd.notna(v)},
                                           float(dp_cash), set(md.stock_ids))
+    if team_id == "TEAM_UNKNOWN":
+        dp_errors.append("team_id 未知：請先放入資料包（或設定 ETF_TEAM_ID）再重跑，否則檔名與內容都會錯")
     warnings += dp_warnings
     problems += [f"D-Plan：{e}" for e in dp_errors]
-    prev_plan = d / "dplan.json"
-    if prev_plan.exists():  # 晨間重跑時保留前一版（例如晚間版），供比對與稽核
-        prev_plan.replace(d / f"dplan_{datetime.now():%Y%m%d_%H%M%S}.json")
-    (d / "dplan.json").write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
+    # 官方檔名：D-Plan_<team_id>_<trade_date>.json（同日重繳用同一檔名）。
+    # 重跑時前一版（例如晚間版）移到 previous/，供比對與稽核
+    plan_path = d / dpl.plan_filename(team_id, trade_date)
+    for old in d.glob("D-Plan_*.json"):
+        (d / "previous").mkdir(exist_ok=True)
+        old.replace(d / "previous" / f"{datetime.now():%Y%m%d_%H%M%S}_{old.name}")
+    plan_path.write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
+    dpl.save_evidence(d / "evidence", plan, md, asof, close, ctx)
     (d / "dplan_validation.json").write_text(
         json.dumps({"errors": dp_errors, "warnings": dp_warnings, "n_orders": len(plan["orders"]),
                     "n_decisions": len(plan["decisions"]), "n_no_trade": len(plan["no_trade_decisions"])},
@@ -547,7 +557,7 @@ def finalize(trade_date: str, cfg: AgentConfig | None = None, md: MarketData | N
     _write_status(trade_date, state=state, author=decision.author, n_orders=len(order_df),
                   problems=problems)
     _log(trade_date, "finalized", state=state, author=decision.author, n_orders=len(order_df),
-         problems=problems, orders_sha=_sha(d / "orders.csv"), dplan_sha=_sha(d / "dplan.json"))
+         problems=problems, orders_sha=_sha(d / "orders.csv"), dplan=plan_path.name, dplan_sha=_sha(plan_path))
     return d
 
 

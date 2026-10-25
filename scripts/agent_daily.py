@@ -58,6 +58,7 @@ def main() -> None:
         pipeline.RUNS_DIR = ROOT / "dryrun" / "runs"
         pipeline.LEDGER_PATH = ROOT / "dryrun" / "state" / "ledger.json"
         pipeline.INBOX_DIR = ROOT / "dryrun" / "inbox"
+        pipeline.TEAM_ID_PATH = ROOT / "dryrun" / "state" / "team_id.txt"
         print("[dry-run] 使用 dryrun/，不影響正式紀錄")
 
     if args.cmd == "prepare":
@@ -83,7 +84,8 @@ def main() -> None:
         print(f"交易日 {td}：{st['state']}，決策來源 {st['author']}，委託 {st['n_orders']} 筆")
         for prob in st.get("problems", []):
             print(f"  ❌ {prob}")
-        print(f"D-Plan（上傳這個）：{d / 'dplan.json'}")
+        plans = sorted(d.glob("D-Plan_*.json"))
+        print(f"D-Plan（上傳這個）：{plans[-1] if plans else '（未產生）'}")
         print(f"人讀報告：{d / 'report.md'}")
 
     elif args.cmd == "window":
@@ -98,12 +100,13 @@ def main() -> None:
     elif args.cmd == "compare":
         td = latest_prepared()
         d = pipeline.RUNS_DIR / td
-        olds = sorted(d.glob("dplan_*.json"))
-        if not (d / "dplan.json").exists() or not olds:
+        olds = sorted((d / "previous").glob("*_D-Plan_*.json"))
+        news = sorted(d.glob("D-Plan_*.json"))
+        if not news or not olds:
             sys.exit(f"{td}：沒有可比較的前一版 D-Plan")
         key = lambda p: {(o["ticker"], o["side"], o["shares"])
                          for o in json.loads(p.read_text(encoding="utf-8"))["orders"]}
-        new, old = key(d / "dplan.json"), key(olds[-1])
+        new, old = key(news[-1]), key(olds[-1])
         if new == old:
             print(f"{td}：委託與前一版（{olds[-1].name}）完全相同，不需要重新上傳")
         else:

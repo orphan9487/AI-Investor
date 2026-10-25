@@ -140,6 +140,9 @@ finalize 會把它組進 D-Plan 的證據鏈：**sources（來源）→ observat
   TradingView 新聞的 `published` 是 unix 秒（UTC），要換成台北時間，例如：
   `python -c "import datetime as d; print(d.datetime.fromtimestamp(1792142142, d.timezone(d.timedelta(hours=8))).isoformat())"`
 - 不要使用繳交當下之後才會發生的資訊。
+- **新聞來源（`media`）要存檔佐證**：用 WebFetch 開 `https://web.archive.org/save/<原網址>` 觸發存檔，
+  取得的快照網址（`https://web.archive.org/web/<時間>/<原網址>`）填進該 source 的 `archive_url`。
+  存檔失敗就不填，但這則新聞的重要性要打折（主辦方對沒有存檔的關鍵來源會優先審查）。
 - `regime`：`risk_on`／`neutral`／`risk_off`。`risk_level` 決定投入比例（見上表）。
   淨曝險意圖（加碼／持平／減碼）與目標現金區間由程式依委託實際結果填寫，保證和委託一致，你不用寫。
 - 沒有要調整的就留空陣列；這是完全合理的結果。
@@ -150,7 +153,7 @@ finalize 會把它組進 D-Plan 的證據鏈：**sources（來源）→ observat
 python scripts/agent_daily.py finalize
 ```
 
-finalize 會產出 `runs/<交易日>/dplan.json`（要上傳的檔案），並模擬主辦方的收件檢核
+finalize 會產出 `runs/<交易日>/D-Plan_<team_id>_<交易日>.json`（要上傳的檔案，官方檔名規約；同日重繳同一檔名），並模擬主辦方的收件檢核
 （schema、引用鏈、決策覆蓋、委託推導、部位宣告、現金比、持股檔數），結果在 `dplan_validation.json`。
 
 - 狀態 `final`：完成，檢核全數通過。
@@ -173,20 +176,20 @@ python scripts/agent_daily.py compare
 ```
 
 - 「完全相同，不需要重新上傳」：晚間版仍然有效，告訴使用者不用動作。
-- 「委託有變動」：請使用者在 08:55 前上傳新的 `dplan.json` 並送出。
+- 「委託有變動」：請使用者在 08:55 前上傳新的 `D-Plan_<team_id>_<交易日>.json` 並送出。
 
 ### 8. 回報
 
 最後的回覆用繁體中文簡短說明：交易日、風險水位、做了哪些調整與理由、委託筆數、
-**`dplan.json` 的路徑（提醒使用者上傳並按「送出繳交」）**、`report.md` 的路徑，以及任何警告或錯誤。
+**`D-Plan_<team_id>_<交易日>.json` 的路徑（提醒使用者上傳並按「送出繳交」）**、`report.md` 的路徑，以及任何警告或錯誤。
 
-**通知使用者**（使用者可能不在電腦前）：如果有 `SendUserFile` 工具，把 `dplan.json` 傳給使用者
+**通知使用者**（使用者可能不在電腦前）：如果有 `SendUserFile` 工具，把 `D-Plan_<team_id>_<交易日>.json` 傳給使用者
 （status 用 `proactive`），說明是晚間版還是晨間更新版、是否需要上傳、截止時間 08:55；
 如果有 `PushNotification` 工具，也發一則簡短推播。狀態是 `blocked`、資料包缺漏或流程失敗時更要通知。
 
 ## 不可以做的事
 
-- 修改任何程式碼、`state/ledger.json`、`context.json`、`orders.csv`、`dplan.json`
+- 修改任何程式碼、`state/ledger.json`、`context.json`、`orders.csv`、D-Plan 檔
 - 手動改交易書的股數或價格
 - 交易標的池以外的股票，或繞過程式的任何限制
 - 詢問使用者「要不要這樣做」：決策必須由 Agent 自主產生

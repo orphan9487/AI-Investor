@@ -92,3 +92,16 @@ def test_weight_for_lots_round_trips(price, lots):
 def test_official_derivation_matches_example_numbers():
     assert dplan.target_shares(0.23, NAV, 1480.0) == 15000
     assert dplan.target_shares(0.045, NAV, 42.5) == 108000
+
+
+def test_ids_must_be_consecutive():
+    dp = official_positive()
+    dp["observations"][2]["obs_id"] = "O4"
+    dp["market_view"]["basis_refs"] = ["O1", "O2", "O4"]
+    dp["inferences"][0]["premise_refs"] = ["O2", "O4"]
+    errors, _ = dplan.validate(dp, PREV, NAV, CLOSE, cash_for(0.05), UNIVERSE)
+    assert any("obs_id 必須依序" in e for e in errors)
+
+
+def test_plan_filename():
+    assert dplan.plan_filename("TEAM_042", "2026-10-28") == "D-Plan_TEAM_042_2026-10-28.json"
