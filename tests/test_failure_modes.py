@@ -148,3 +148,25 @@ def test_funding_for_must_point_to_buy():
     dp["decisions"][1]["funding_for"] = ["D1"]  # D2 是 BUY，不能宣告調度；D1 也不是買進
     errors, _ = dplan.validate(dp, PREV, NAV, CLOSE, cash_for(0.05), UNIVERSE)
     assert any("funding_for" in e for e in errors)
+
+
+def test_passive_overweight_is_flagged_and_trimmed(sandbox):
+    md = make_md()
+    td = _td(md)
+    shares = {s: 30_000 for s in ["2330"] + [f"{1101 + i}" for i in range(1, 24)]}
+    shares["1102"] = 1_100_000                      # 110 萬股 × 100 元 ≈ 淨值 10.6%：被動超限
+    holdings = [{"code": s, "shares": n, "receivable_shares": 0, "close_price": 100.0,
+                 "tradable_weight": n * 100.0 / 1.04e9} for s, n in shares.items()]
+    pack = _pack(trade_date=td, as_of_date=md.dates[-1].date().isoformat(), holdings=holdings,
+                 account={"cash": 1.04e9 - sum(shares.values()) * 100.0, "cash_ratio_tradable": 0.2,
+                          "nav_tradable": 1.04e9, "aum": 1.04e9, "receivable_cash": 0.0, "holdings_count": 24},
+                 compliance={"violations": 0, "notices": 1, "incidents": [
+                     {"date": md.dates[-1].date().isoformat(), "check_code": "weight_cap", "status": "warn",
+                      "message": "1102 權重超過 10%"}]})
+    out, st = _formal_run(md, td, pack=pack)
+    health = json.loads((out / "context.json").read_text(encoding="utf-8"))["health"]
+    cap = next(c for c in health if c["name"] == "個股權重上限")
+    assert not cap["ok"] and "1102" in cap["detail"] and "5 個交易日" in cap["detail"]
+    plan = json.loads(next(out.glob("D-Plan_*.json")).read_text(encoding="utf-8"))
+    trim = next(o for o in plan["orders"] if o["ticker"] == "1102")
+    assert trim["side"] == "SELL"                    # 隔天就減碼，不拖到第 5 天
