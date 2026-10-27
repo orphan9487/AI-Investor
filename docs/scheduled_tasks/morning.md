@@ -11,7 +11,7 @@ description: AI CUP 2026 玉山挑戰賽：交易日 06:30 加入隔夜美股與
 
 1. 先跑 `python scripts/agent_daily.py window`。結束代碼為 1 代表今天不是交易日，直接結束並回報「今天不需執行」。
 2. 跑 `python scripts/agent_daily.py prepare`（會重新讀取 inbox/ 的資料包；若昨晚缺資料包而使用者之後補上了，這次就會用到）。
-3. 讀 runs/<交易日>/context.md 與昨晚的 decision.json（若存在）。用 TradingView 的 mcp-tv-get-symbol-data-batch 查隔夜美股與台積電 ADR：NASDAQ:SOX、NASDAQ:NDX、SP:SPX、NYSE:TSM（欄位 close、change），台指期夜盤可用 mcp-tv-search-symbols 搜尋。把有用的數字寫進 decision.json 的 sources／observations／market_basis（authority=vendor）。只有隔夜出現明顯訊號（例如費半或 TSM ADR 單日漲跌超過 2–3%、夜盤大幅跳空）才改變昨晚的調整；否則沿用昨晚的調整內容。
+3. 讀 runs/<交易日>/context.md 與昨晚的 decision.json（若存在）。用 TradingView 的 mcp-tv-get-symbol-data-batch 查隔夜美股與台積電 ADR：NASDAQ:SOX、NASDAQ:NDX、SP:SPX、NYSE:TSM（欄位 close、change），台指期夜盤可用 mcp-tv-search-symbols 搜尋。把有用的數字寫進 decision.json 的 sources／observations／market_basis（authority=vendor）。只有隔夜出現明顯訊號（例如費半或 TSM ADR 單日漲跌超過 2–3%、夜盤大幅跳空）才改變昨晚的調整；否則沿用昨晚的調整內容。若昨晚之後才有持股／候選股公布財報或法說會內容，依手冊步驟 4b 查證後再決定是否調整。
 4. 跑 `python scripts/agent_daily.py finalize`，確認狀態為 final 且 dplan_validation.json 沒有錯誤；blocked 時依手冊修正或刪除 decision.json 重跑。
 5. 跑 `python scripts/agent_daily.py compare`，比較與昨晚版 D-Plan 的委託（前一版在 runs/<交易日>/previous/）。
 6. 通知使用者（使用者可能只在手機上）：
