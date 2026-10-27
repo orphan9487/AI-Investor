@@ -271,6 +271,20 @@ def prepare(update: bool = True, cfg: AgentConfig | None = None, md: MarketData 
         elif dp.as_of_date and dp.prev_outcome == "executed":
             _write_status(dp.as_of_date, state="settled", source="DataPack", excluded=dp.excluded_codes)
         _log(trade_date, "datapack_applied", source=dp.source, generated_at=dp.generated_at, diff=dp_diff)
+    if dp is not None and dp.has_positions:
+        # 被動超限：股價上漲使權重超過上限，只提示；但連續 5 個交易日仍超限就記違規，必須在期限內減碼
+        over = []
+        for h in dp.holdings:
+            w = h.get("tradable_weight")
+            if w is not None and w > RULES.cap_for(str(h["code"])):
+                streak = sum(1 for inc in dp.compliance.get("incidents", [])
+                             if str(h["code"]) in str(inc.get("message", "")) and inc.get("status") == "warn")
+                halted = (pd.isna(md.panels["volume"].loc[asof].get(str(h["code"])))
+                          or not md.panels["volume"].loc[asof].get(str(h["code"]), 0) > 0)
+                over.append(f"{h['code']} 權重 {w:.2%}（上限 {RULES.cap_for(str(h['code'])):.0%}；平台已提示約 {streak} 次"
+                            + ("；⚠ 最近一日無成交，可能無法減碼" if halted else "；本次 finalize 會自動減碼回目標") + "）")
+        checks.append(Check("個股權重上限", not over,
+                            "無超限" if not over else "被動超限，須在 5 個交易日內減碼：" + "；".join(over)))
     elif dp is not None:
         checks.append(Check("資料包", False, "平台尚無前一交易日結算（missing 含 prev_settlement），改用模擬帳本；"
                                             "結算產生後請重新下載資料包再執行"))
