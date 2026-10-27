@@ -148,3 +148,44 @@ def test_funding_for_must_point_to_buy():
     dp["decisions"][1]["funding_for"] = ["D1"]  # D2 是 BUY，不能宣告調度；D1 也不是買進
     errors, _ = dplan.validate(dp, PREV, NAV, CLOSE, cash_for(0.05), UNIVERSE)
     assert any("funding_for" in e for e in errors)
+
+
+@pytest.mark.parametrize("source", ["explicit", "inbox"])
+@pytest.mark.parametrize("guard", ["configured", "stored", "conflicting_config", "missing_team"])
+def test_prepare_rejects_identity_before_any_mutation(sandbox, monkeypatch, source, guard):
+    from etf_agent.agent.datapack import DataPackError
+    from etf_agent.data import daily
+
+    td = "2026-10-27"
+    pipeline.TEAM_ID_PATH.parent.mkdir(parents=True, exist_ok=True)
+    if guard in ("stored", "conflicting_config"):
+        pipeline.TEAM_ID_PATH.write_text("TEAM_042", encoding="utf-8")
+    pipeline.LEDGER_PATH.write_text('{"sentinel": "unchanged"}', encoding="utf-8")
+    pipeline.INBOX_DIR.mkdir(parents=True, exist_ok=True)
+    pack = _first_day_pack(td, team_id="" if guard == "missing_team" else "TEAM_999")
+    path = pipeline.INBOX_DIR / "dp.json"
+    path.write_text(json.dumps(pack), encoding="utf-8")
+    cfg_team = "TEAM_042" if guard == "configured" else "TEAM_999" if guard == "conflicting_config" else ""
+    before = {p.relative_to(sandbox): p.read_bytes() for p in sandbox.rglob("*") if p.is_file()}
+    monkeypatch.setattr(daily, "daily_update", lambda: pytest.fail("data update ran before identity validation"))
+    with pytest.raises(DataPackError, match="隊伍|team_id"):
+        pipeline.prepare(cfg=pipeline.AgentConfig(team_id=cfg_team), trade_date=td,
+                         datapack_path=path if source == "explicit" else None)
+    assert before == {p.relative_to(sandbox): p.read_bytes() for p in sandbox.rglob("*") if p.is_file()}
+
+
+@pytest.mark.parametrize("explicit_date", [True, False])
+def test_explicit_stale_datapack_cannot_change_expected_day(sandbox, monkeypatch, explicit_date):
+    from datetime import datetime
+    from etf_agent.agent.datapack import DataPackError
+    from etf_agent.data import daily
+
+    path = sandbox / "old.json"
+    path.write_text(json.dumps(_first_day_pack("2026-10-26")), encoding="utf-8")
+    monkeypatch.setattr(daily, "daily_update", lambda: pytest.fail("data update ran before date validation"))
+    with pytest.raises(DataPackError, match="預期交易日 2026-10-27"):
+        pipeline.prepare(trade_date="2026-10-27" if explicit_date else None,
+                         now=datetime(2026, 10, 26, 20, 40), holidays=set(), datapack_path=path)
+    assert not pipeline.RUNS_DIR.exists()
+    assert not pipeline.LEDGER_PATH.exists()
+    assert not pipeline.TEAM_ID_PATH.exists()

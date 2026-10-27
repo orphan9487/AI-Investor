@@ -33,6 +33,10 @@ def sandbox(tmp_path, monkeypatch):
     """把 pipeline 裡所有指向專案資料夾的路徑（runs/、state/、inbox/…）自動導到暫存資料夾，
     新增路徑常數時不會漏掉，測試永遠不會寫進正式紀錄。"""
     from pathlib import Path
+    from etf_agent.data import exchange
+
+    # Synthetic portfolio tests must not depend on the live holiday API.
+    monkeypatch.setattr(exchange, "twse_holidays", lambda: set())
 
     root = pipeline.store.PROJECT_ROOT
     for name in dir(pipeline):

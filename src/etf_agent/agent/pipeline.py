@@ -218,6 +218,20 @@ def prepare(update: bool = True, cfg: AgentConfig | None = None, md: MarketData 
     from . import datapack as dpk
 
     cfg = cfg or AgentConfig()
+    # Validate identity before updates, archiving, settlement or ledger writes.
+    trade_date = trade_date or target_trade_date(now or datetime.now(), holidays).date().isoformat()
+    dp = dpk.load(datapack_path) if datapack_path else dpk.find_latest(INBOX_DIR, trade_date)
+    if dp is not None:
+        if dp.trade_date != trade_date:
+            raise dpk.DataPackError(
+                f"資料包的交易日 {dp.trade_date} 與預期交易日 {trade_date} 不同")
+        stored_team = TEAM_ID_PATH.read_text(encoding="utf-8").strip() if TEAM_ID_PATH.exists() else ""
+        for expected_team in (cfg.team_id, stored_team):
+            if expected_team and dp.team_id != expected_team:
+                raise dpk.DataPackError(
+                    f"資料包隊伍 {dp.team_id!r} 與固定隊伍 {expected_team} 不同")
+        if not dp.team_id:
+            raise dpk.DataPackError("資料包缺少 team_id，不能更新帳本")
     if update:
         from ..data.daily import daily_update
 
@@ -226,15 +240,10 @@ def prepare(update: bool = True, cfg: AgentConfig | None = None, md: MarketData 
 
     md = md or MarketData.load()
     asof = md.dates[-1]
-    trade_date = trade_date or target_trade_date(now or datetime.now(), holidays).date().isoformat()
-    # 資料包的 trade_date 是平台指定的決策日，最權威
-    dp = dpk.load(datapack_path) if datapack_path else dpk.find_latest(INBOX_DIR, trade_date)
     if dp is None and not allow_stale:
         bad = dpk.inbox_errors(INBOX_DIR)
         if bad:  # 有資料包卻讀不了：不可默默改用模擬帳本
             raise dpk.DataPackError("inbox/ 有無法讀取的資料包，已停止：" + "；".join(bad))
-    if dp is not None and dp.trade_date != trade_date:
-        trade_date = dp.trade_date
     d = run_dir(trade_date)
     d.mkdir(parents=True, exist_ok=True)
     archive_run(d)  # 晨間重跑前封存晚間版的完整紀錄，確保每一版 D-Plan 都可重現
