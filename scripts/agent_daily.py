@@ -3,6 +3,7 @@
   python scripts/agent_daily.py prepare                 # 更新資料 + 結算 + 產出 context
   python scripts/agent_daily.py prepare --no-update     # 不更新資料（測試用）
   python scripts/agent_daily.py finalize                # 對最近一次 prepare 的交易日產出交易書與報告
+  python scripts/agent_daily.py already-final           # 已有用目前資料包產出的 final D-Plan 時結束代碼為 0
   python scripts/agent_daily.py status                  # 帳本與各交易日狀態
   python scripts/agent_daily.py reconcile holdings.csv --cash 12345678 --asof 2026-10-27
                                                         # 用平台公布的持股覆蓋帳本
@@ -48,6 +49,7 @@ def main() -> None:
     f.add_argument("--trade-date")
     sub.add_parser("status")
     sub.add_parser("window", help="現在是否在繳交窗口；不在時結束代碼為 1")
+    sub.add_parser("already-final", help="本窗口已有用目前資料包產出的 final D-Plan 時結束代碼為 0，否則為 1")
     sub.add_parser("compare", help="比較本交易日最新 D-Plan 與前一版的委託")
     r = sub.add_parser("reconcile")
     r.add_argument("holdings_csv", help="欄位 stock_id, shares")
@@ -104,6 +106,15 @@ def main() -> None:
         if td is None:
             sys.exit(1)
         print(f"交易日 {td}")
+
+    elif args.cmd == "already-final":
+        from datetime import datetime
+
+        td, _ = pipeline.submission_window(datetime.now())
+        if td is None or not pipeline.final_for_current_datapack(td):
+            print(f"{td or '不在繳交窗口'}：沒有用目前資料包產出的 final D-Plan")
+            sys.exit(1)
+        print(f"{td}：已有用目前資料包產出的 final D-Plan，不需重跑")
 
     elif args.cmd == "compare":
         td = latest_prepared()

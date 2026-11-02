@@ -12,7 +12,8 @@
 
 ## 執行時段（方案 C）
 
-- **晚間（20:30）**：產出當晚版 D-Plan，讓使用者睡前上傳保底。
+- **晚間（22:00）**：產出當晚版 D-Plan，讓使用者睡前上傳保底。平台資料包約在 20:15–22:15 出現；
+  如果已經手動用同一份資料包產出 final 版（`agent_daily.py already-final` 結束代碼為 0），晚間排程就不重跑。
 - **晨間（06:30）**：加入隔夜美股、台積電 ADR、台指期夜盤等資訊重新評估；委託有變動才請使用者重新上傳
   （每天可送出 25 次，以 08:55 前最後一次為準）。
 
@@ -60,6 +61,8 @@ python scripts/agent_daily.py prepare
 - 再查基準組合中權重最高、或重大訊息提到的幾檔
 - TradingView 對台股中小型股的新聞很少、常常過期，查不到是正常的，不要因此調整
 - 只採用 `published`（unix 秒）在最近 7 天內的新聞
+- 要引用或判斷前，用 `mcp-tv-get-news-story` 讀全文（`id` 用新聞列表的 `id`、`lang="zh-Hant"`）。
+  `paywall: true`、`permission: "headline"` 的路透新聞通常也拿得到全文，不要只看標題就下判斷；全文讀不到才算只有標題。
 - 需要時可用 `mcp-tv-get-symbol-data-batch` 查 `price_earnings_ttm`、`RSI`、`Perf.1M`
 - **不要使用 `mcp-tv-get-forecasts` 的目標價**：台股資料的單位對不上（已知問題）
 
@@ -188,9 +191,10 @@ finalize 會把它組進 D-Plan 的證據鏈：**sources（來源）→ observat
   TradingView 新聞的 `published` 是 unix 秒（UTC），要換成台北時間，例如：
   `python -c "import datetime as d; print(d.datetime.fromtimestamp(1792142142, d.timezone(d.timedelta(hours=8))).isoformat())"`
 - 不要使用繳交當下之後才會發生的資訊。
-- **新聞來源（`media`）要存檔佐證**：用 WebFetch 開 `https://web.archive.org/save/<原網址>` 觸發存檔，
-  取得的快照網址（`https://web.archive.org/web/<時間>/<原網址>`）填進該 source 的 `archive_url`。
-  存檔失敗就不填，但這則新聞的重要性要打折（主辦方對沒有存檔的關鍵來源會優先審查）。
+- **新聞來源（`media`）要存檔佐證**：用 Bash 跑下面的指令觸發存檔（網址不要加引號；WebFetch 連不上 archive.org）：
+  `curl -sS -L -m 90 -o /dev/null -w "http=%{http_code} final=%{url_effective}\n" https://web.archive.org/save/<原網址>`
+  `http=200` 時，把輸出的快照網址（`https://web.archive.org/web/<時間>/<原網址>`）填進該 source 的 `archive_url`。
+  只存實際引用的新聞。存檔失敗就不填，但這則新聞的重要性要打折（主辦方對沒有存檔的關鍵來源會優先審查）。
 - `regime`：`risk_on`／`neutral`／`risk_off`。`risk_level` 決定投入比例（見上表）。
   淨曝險意圖（加碼／持平／減碼）與目標現金區間由程式依委託實際結果填寫，保證和委託一致，你不用寫。
 - 沒有要調整的就留空陣列；這是完全合理的結果。

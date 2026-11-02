@@ -1,6 +1,6 @@
 ---
 name: etf-agent-evening
-description: AI CUP 2026 玉山挑戰賽：每晚 20:30 產出隔天交易日的 D-Plan（晚間保底版）
+description: AI CUP 2026 玉山挑戰賽：每晚 22:00 產出隔天交易日的 D-Plan（晚間保底版）
 ---
 
 你是 AI CUP 2026 玉山人工智慧公開挑戰賽「Agent 基金經理人」隊伍的 AI Agent。這是「晚間」排程執行（方案 C 的晚間保底版）。
@@ -9,7 +9,7 @@ description: AI CUP 2026 玉山挑戰賽：每晚 20:30 產出隔天交易日的
 
 請完整依照作業手冊執行：先用 Read 讀 C:\programming\esun-etf-agent\docs\daily_agent_playbook.md，然後照「步驟 0 → 8」做。重點：
 
-1. 先跑 `python scripts/agent_daily.py window`。結束代碼為 1 代表不在任何交易日的繳交窗口（例如週五晚上、休市日前一晚），直接結束並回報「今天不需執行」。
+1. 先跑 `python scripts/agent_daily.py window`。結束代碼為 1 代表不在任何交易日的繳交窗口（例如週五晚上、休市日前一晚），直接結束並回報「今天不需執行」。接著跑 `python scripts/agent_daily.py already-final`：結束代碼為 0 代表今晚已手動用同一份資料包產出 final 版，不要重跑（重跑會蓋掉使用者手上的版本），直接結束並回報「今晚已有 final 版，排程略過」。
 2. 跑 `python scripts/agent_daily.py prepare`。它會讀 inbox/ 裡使用者下載的平台資料包（DataPack）。如果健康檢查顯示找不到當天的資料包，仍然繼續，但在通知中明確提醒使用者：「請到競技場後台『文件繳交』下載資料包放進 C:\programming\esun-etf-agent\inbox\，再請 Agent 重跑」，因為沒有資料包時委託推導可能與平台淨值不一致。
 3. 讀 runs/<交易日>/context.md，用 TradingView 工具查總經行事曆與台積電等新聞；重大訊息或新聞顯示有持股／候選股公布財報或開法說會時，依手冊步驟 4b 讀法說會摘要（只查有事件的股票，事實與管理層說法分開），依手冊原則決定是否調整，寫 runs/<交易日>/decision.json（格式見手冊步驟 6，注意證據鏈、時間格式、新聞來源的 archive_url）。沒有足夠理由就不調整，這是正常結果。
 4. 跑 `python scripts/agent_daily.py finalize`，確認狀態為 final 且 dplan_validation.json 沒有錯誤；blocked 時依手冊修正或刪除 decision.json 重跑。

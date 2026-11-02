@@ -35,6 +35,7 @@ python scripts/update_data.py                    # 標的池 + 日 K + 官方收
 python scripts/update_data.py --finmind all      # 加上法人、月營收、股利、本益比（沒有 token 約 2 小時）
 python -m pytest                                 # 單元測試
 python scripts/run_backtest.py --windows --strategy cap_weighted,equal_weight,momentum --start 2022-01-01
+python scripts/significance.py output/windows_base.csv output/windows_variant.csv  # 超額與配對差的顯著性檢定
 ```
 
 FinMind 免費註冊後把 token 設在環境變數 `FINMIND_TOKEN`，下載速度快一倍。

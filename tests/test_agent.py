@@ -308,6 +308,29 @@ def test_submission_window():
     assert w(datetime(2026, 10, 27, 12, 0), hol)[0] is None            # 盤中
 
 
+def test_final_for_current_datapack(sandbox):
+    from etf_agent.agent import datapack as dpk
+
+    td = "2026-10-28"
+    d = pipeline.run_dir(td)
+    d.mkdir(parents=True)
+    pipeline.INBOX_DIR.mkdir(parents=True)
+    pack = pipeline.INBOX_DIR / "datapack.json"
+    assert not pipeline.final_for_current_datapack(td)  # 還沒有資料包
+    pack.write_text(json.dumps(_pack()), encoding="utf-8")
+    assert not pipeline.final_for_current_datapack(td)  # 還沒有 D-Plan
+    (d / "DO_NOT_SUBMIT_D-Plan_T_2026-10-28.json").write_text("{}", encoding="utf-8")
+    assert not pipeline.final_for_current_datapack(td)  # 被擋下的版本不算
+    (d / "D-Plan_T_2026-10-28.json").write_text("{}", encoding="utf-8")
+    (d / "run_manifest.json").write_text(json.dumps({"datapack": {"sha256": dpk.file_sha256(pack)}}), encoding="utf-8")
+    (d / "status.json").write_text(json.dumps({"state": "blocked"}), encoding="utf-8")
+    assert not pipeline.final_for_current_datapack(td)
+    (d / "status.json").write_text(json.dumps({"state": "final"}), encoding="utf-8")
+    assert pipeline.final_for_current_datapack(td)
+    pack.write_text(json.dumps(_pack(generated_at="2026-10-27T22:00:00+08:00")), encoding="utf-8")
+    assert not pipeline.final_for_current_datapack(td)  # 平台更新了資料包，要重跑
+
+
 def test_unknown_team_blocks_finalize(sandbox):
     md = make_md()
     td = (md.dates[-1] + pd.offsets.BDay(1)).date().isoformat()

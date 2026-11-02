@@ -1,5 +1,6 @@
 pandas>=2.2
 numpy
+scipy
 pyarrow
 requests
 yfinance>=0.2.40

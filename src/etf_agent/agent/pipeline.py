@@ -113,6 +113,22 @@ def run_dir(trade_date: str) -> Path:
     return RUNS_DIR / trade_date
 
 
+def final_for_current_datapack(trade_date: str) -> bool:
+    """這個交易日是否已經有用 inbox 目前的資料包產出的 final D-Plan（晚間排程用來避免覆蓋手動版）。"""
+    from . import datapack as dpk
+
+    d = run_dir(trade_date)
+    dp = dpk.find_latest(INBOX_DIR, trade_date)
+    if dp is None or not any(d.glob("D-Plan_*.json")):
+        return False
+    try:
+        state = json.loads((d / "status.json").read_text(encoding="utf-8"))["state"]
+        used = json.loads((d / "run_manifest.json").read_text(encoding="utf-8"))["datapack"]["sha256"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+    return state == "final" and used == dpk.file_sha256(dp.source)
+
+
 def _log(trade_date: str, event: str, **data) -> None:
     d = run_dir(trade_date)
     d.mkdir(parents=True, exist_ok=True)
