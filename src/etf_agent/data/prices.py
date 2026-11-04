@@ -122,16 +122,21 @@ def trading_calendar(start: str, end: str | None = None) -> pd.DatetimeIndex:
 
 
 def repair_bad_days(prices: pd.DataFrame, calendar: pd.DatetimeIndex, markets: dict[str, str],
-                    splits: pd.DataFrame | None = None) -> pd.DataFrame:
+                    splits: pd.DataFrame | None = None, through: pd.Timestamp | None = None) -> pd.DataFrame:
     """yfinance 有時整天漏掉某個市場，或塞進「成交量 0、價格不動」的佔位資料。
     找出這些（日期, 市場），改用 TWSE/TPEx 官方單日行情取代；
     adj_close 用該股前後交易日的還原比例換算。
 
     markets: {stock_id: "twse" | "tpex"}
+    through: 資料應該涵蓋到的最後交易日。yfinance 偶爾給最新一天整列空白（被 dropna 掉），
+             只看資料本身的最後一天會漏掉這種缺漏。
     """
-    calendar = calendar[(calendar >= prices["date"].min()) & (calendar <= prices["date"].max())]
+    data_last = prices["date"].max()
+    stop = data_last if through is None else max(data_last, through)
+    calendar = calendar[(calendar >= prices["date"].min()) & (calendar <= stop)]
     first = prices.groupby("stock_id")["date"].min()
     last = prices.groupby("stock_id")["date"].max()
+    last[last == data_last] = stop  # 有最新資料的股票，在缺漏的尾端幾天仍視為有交易
     traded = prices[prices["volume"] > 0]
 
     bad: list[tuple[pd.Timestamp, str]] = []
@@ -246,8 +251,13 @@ def update_prices(universe: pd.DataFrame, start: str, end: str | None = None) ->
                   file=sys.stderr)
             prices = pd.concat([prices[prices["stock_id"] != sid], alt], ignore_index=True)
     calendar = trading_calendar(start, end)
+    through = None
+    if end is None:  # 每日更新：收盤資料約 14:30 後才完整，之前只要求到前一個交易日
+        now = pd.Timestamp.now()
+        done = calendar[calendar < now.normalize()] if now.hour + now.minute / 60 < 14.5 else calendar
+        through = done.max() if len(done) else None
     markets = dict(zip(universe["stock_id"], universe["market"]))
-    prices = repair_bad_days(prices, calendar, markets, splits)
+    prices = repair_bad_days(prices, calendar, markets, splits, through)
     off_calendar = sorted(set(prices["date"]) - set(calendar))
     if off_calendar:
         print(f"  移除非交易日資料：{[d.date() for d in off_calendar]}", file=sys.stderr)
@@ -265,7 +275,8 @@ def update_prices(universe: pd.DataFrame, start: str, end: str | None = None) ->
               file=sys.stderr)
     store.write_parquet(prices, store.PRICES_PATH)
 
-    bench = repair_bad_days(_download(BENCHMARKS, start, end), calendar, {s: "twse" for s in BENCHMARKS})
+    bench = repair_bad_days(_download(BENCHMARKS, start, end), calendar, {s: "twse" for s in BENCHMARKS},
+                            through=through)
     store.write_parquet(bench, store.BENCHMARK_PATH)
     return prices
 

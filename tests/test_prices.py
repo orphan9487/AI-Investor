@@ -29,6 +29,20 @@ def test_repair_replaces_placeholder_and_missing_days(monkeypatch):
     assert out[out["date"] == dates[2]]["stock_id"].nunique() == 4
 
 
+def test_repair_fills_missing_latest_day(monkeypatch):
+    dates = pd.bdate_range("2026-03-02", periods=3)
+    # yfinance 最新一天整列空白、dropna 後完全消失
+    rows = [(d, sid, 100.0, 100.0, 100.0, 100.0, 100.0, 1e6, 100.0) for d in dates[:2] for sid in ("2330", "2317")]
+    df = pd.DataFrame(rows, columns=P.COLUMNS)
+    monkeypatch.setattr(P, "twse_daily_quotes", lambda d: pd.DataFrame(
+        {"stock_id": ["2330", "2317"], "name": "", "open": 98.0, "high": 99.0, "low": 97.0, "close": 98.0,
+         "volume": 5e5}))
+    assert P.repair_bad_days(df, dates, {"2330": "twse", "2317": "twse"})["date"].max() == dates[1]
+    out = P.repair_bad_days(df, dates, {"2330": "twse", "2317": "twse"}, through=dates[2])
+    last = out[out["date"] == dates[2]]
+    assert len(last) == 2 and (last["close"] == 98.0).all()
+
+
 def test_repair_converts_raw_exchange_prices_to_adjusted_basis(monkeypatch):
     dates = pd.bdate_range("2026-03-02", periods=3)
     rows = [(d, "2327", 150.0, 150.0, 150.0, 150.0, 150.0, 1e6 if d != dates[1] else 0.0, 150.0) for d in dates]
