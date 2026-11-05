@@ -31,13 +31,16 @@ def build_orders(
     rules: CompetitionRules = RULES,
     band: float = 0.0,
     cap_buffer: float = DEFAULT_CAP_BUFFER,
+    force: frozenset[str] | set[str] = frozenset(),
 ) -> dict[str, int]:
     """回傳 {stock_id: 股數變動}，正數買、負數賣，都是整張的倍數。
 
     exec_prices: 成交價；NaN 代表當天不能交易（停牌等），該檔維持原持股
     mark_prices: 估值用價格（不能交易的股票用它算淨值）
-    band: 現有持股與目標權重差距小於 band（占淨值比例）就不動，用來省交易成本
+    band: 現有持股與目標權重差距小於 band（占淨值比例）就不動，用來省交易成本；
+          但現金比目標少超過 2 個 band 時（例如風險水位調降），會解除 band 減碼
     cap_buffer: 權重上限再往下留一點空間，吸收手續費和價格跳動
+    force: 不套用 band 的股票，例如 Agent 指定加減碼的個股（倍數造成的權重變化常小於 band）
     """
     lot = rules.lot_size
     tradable = exec_prices.dropna()
@@ -54,6 +57,7 @@ def build_orders(
 
     names = set(target_w.index) | {sid for sid, n in current.items() if n}
     desired: dict[str, int] = {}
+    banded: dict[str, int] = {}  # 因 band 維持原股數的股票 → 目標股數
     for sid in names:
         cur = int(current.get(sid, 0))
         if sid not in tradable.index:
@@ -63,8 +67,11 @@ def build_orders(
         w = float(target_w.get(sid, 0.0))
         want = math.floor(w * nav / (p * lot)) * lot
         cur_w = cur * p / nav
-        within_band = cur > 0 and want > 0 and abs(cur_w - w) < band and cur_w <= rules.cap_for(sid) - cap_buffer
+        within_band = (sid not in force and cur > 0 and want > 0 and abs(cur_w - w) < band
+                       and cur_w <= rules.cap_for(sid) - cap_buffer)
         desired[sid] = cur if within_band else want
+        if within_band and want != cur:
+            banded[sid] = want
 
     def n_held() -> int:
         return sum(1 for s in names if desired[s] > 0)
@@ -89,6 +96,18 @@ def build_orders(
                 flow += v - rules.sell_cost(v)
         return cash + flow
 
+    # band 會讓股票部位高於目標：風險水位從 98% 降到 88% 時，各檔只差零點幾個百分點，一檔都不會減。
+    # 下單前的現金比目標少超過 2 個 band 時，從超配最多的股票開始解除 band、回到目標股數，直到回到目標。
+    # 門檻用下單前現金、而且是 2 個 band：維持原風險水位時，漲多造成的小幅超配照舊不動（回測驗證不變）
+    target_cash = (1 - float(target_w.sum())) * nav
+    if cash < target_cash - 2 * band * nav:
+        over = sorted((s for s in banded if banded[s] < desired[s]),
+                      key=lambda s: -(desired[s] - banded[s]) * float(tradable[s]))
+        for sid in over:
+            if projected_cash() >= target_cash:
+                break
+            desired[sid] = banded[sid]
+
     # 現金不夠就從買最多的那檔一張一張減
     while projected_cash() < 0:
         buying = [s for s in names if desired[s] > int(current.get(s, 0))]
@@ -98,7 +117,6 @@ def build_orders(
         desired[sid] -= lot
 
     # 取整和 band 會讓現金高於目標：多出的現金超過 band 時，一張一張補給低配最多、還沒碰到上限的股票
-    target_cash = (1 - float(target_w.sum())) * nav
     if projected_cash() - target_cash > band * nav:
         candidates = [s for s in target_w.index if s in tradable.index]
         while True:

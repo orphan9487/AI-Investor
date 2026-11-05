@@ -549,11 +549,14 @@ def finalize(trade_date: str, cfg: AgentConfig | None = None, md: MarketData | N
     shadow_final, _ = apply_decision(fallback(trade_date, "影子組合：純量化"), base, candidates)
 
     # 下單股數以最新收盤價估算；壓力測試：開盤全面上漲 stress_gap 時現金仍要夠
-    orders = build_orders(ledger.shares, final, close, close, ledger.cash, band=cfg.band)
+    # Agent 指定加減碼的個股不套用 band，否則 ×0.8 這類調整常常一張都不會動
+    tilted = {a.stock_id for a in decision.tilts if a.multiplier != 1}
+    orders = build_orders(ledger.shares, final, close, close, ledger.cash, band=cfg.band, force=tilted)
     scale = 1.0
     while _stress_cash(ledger, orders, close, cfg.stress_gap) < 0 and scale > 0.8:
         scale -= 0.005
-        orders = build_orders(ledger.shares, final * scale, close, close, ledger.cash, band=cfg.band)
+        orders = build_orders(ledger.shares, final * scale, close, close, ledger.cash, band=cfg.band,
+                              force=tilted)
         warnings.append(f"壓力測試現金不足，投入比例下修為 {scale:.1%}")
 
     post = dict(ledger.shares)
@@ -607,6 +610,7 @@ def finalize(trade_date: str, cfg: AgentConfig | None = None, md: MarketData | N
         nav=float(dp_nav), close={s: float(v) for s, v in close.items() if pd.notna(v)}, cash=float(dp_cash),
         markets=markets, names=names.to_dict(), taiex=taiex, team_id=team_id,
         model_version=cfg.model_version, run_started_at=dpl.ts(ctx["generated"]),
+        target_w=(final * scale).to_dict(),
     )
     # 意圖獨立檢查：研究階段的風險水位決定預期投入比例；委託結果偏離時記錄原因（不覆蓋 D-Plan 的宣告）
     from .decision import RISK_LEVELS

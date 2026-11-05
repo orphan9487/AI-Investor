@@ -85,6 +85,28 @@ def test_band_avoids_small_trades():
     assert build_orders(current, target, px, px, cash, band=0.0) != {}
 
 
+def test_band_does_not_block_lower_exposure():
+    px = pd.Series(100.0, index=IDS)
+    current = {s: 392_000 for s in IDS[:25]}  # 每檔 3.92%，合計 98%
+    cash = 1_000_000_000 - 25 * 39_200_000
+    # 降到 88%：每檔只少 0.4 個百分點，小於 band，但總投入多出 10 個百分點
+    orders = build_orders(current, pd.Series(0.0352, index=IDS[:25]), px, px, cash, band=0.01)
+    post = sum((current[s] + orders.get(s, 0)) * 100.0 for s in current)
+    assert post / 1_000_000_000 == pytest.approx(0.88, abs=0.005)
+    # 維持原投入比例時 band 照常生效
+    assert build_orders(current, pd.Series(0.0392, index=IDS[:25]), px, px, cash, band=0.01) == {}
+
+
+def test_force_bypasses_band():
+    px = pd.Series(100.0, index=IDS)
+    current = {s: 392_000 for s in IDS[:25]}
+    cash = 1_000_000_000 - 25 * 39_200_000
+    target = pd.Series(0.0392, index=IDS[:25])
+    target[IDS[0]] = 0.0392 * 1.2  # Agent 加碼 ×1.2，只差 0.78 個百分點
+    assert IDS[0] not in build_orders(current, target, px, px, cash, band=0.01)
+    assert build_orders(current, target, px, px, cash, band=0.01, force={IDS[0]})[IDS[0]] > 0
+
+
 def test_validate_targets():
     with pytest.raises(ValueError, match="標的池外"):
         validate_targets(pd.Series(0.04, index=IDS[:24] + ["9999"]), set(IDS))

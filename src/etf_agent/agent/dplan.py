@@ -156,6 +156,7 @@ def build(
     team_id: str,
     model_version: str,
     run_started_at: str,
+    target_w: dict[str, float] | None = None,
 ) -> dict:
     trade_date, asof = ctx["trade_date"], pd.Timestamp(ctx["data_asof"])
     ymd, ymd_slash = asof.strftime("%Y%m%d"), asof.strftime("%Y/%m/%d")
@@ -269,7 +270,15 @@ def build(
             logic = (f"{sid} 綜合排名第 {rank} 名，仍在續抱門檻（前 {keep_rank} 名）內；"
                      f"與目標權重的差距小於無交易帶 {band:.0%}，維持不動以節省交易成本")
         else:
-            logic = (f"{sid} 綜合排名第 {rank} 名，續抱；目前權重與目標權重差距超過無交易帶 {band:.0%}，"
+            w_prev, w_tgt = prev * close[sid] / nav, (target_w or {}).get(sid)
+            if a is not None:
+                why = "依 Agent 調整後的目標權重"
+            elif post < prev and w_tgt is not None and abs(w_prev - w_tgt) < band:
+                why = (f"個股差距雖小於無交易帶 {band:.0%}，但總投入比例高於風險水位 {decision.risk_level} 的目標，"
+                       f"依超配幅度減碼")
+            else:
+                why = f"目前權重與目標權重差距超過無交易帶 {band:.0%}"
+            logic = (f"{sid} 綜合排名第 {rank} 名，續抱；{why}，"
                      f"{'加碼' if post > prev else '減碼'}回到目標權重 {w_post:.2%}")
         counter = None
         if a is not None:
